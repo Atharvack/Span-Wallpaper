@@ -25,6 +25,19 @@ def safe_name(name: str) -> str:
     return cleaned or "display"
 
 
+def unique_path(path: Path) -> Path:
+    """Return ``path`` if free, else ``stem (1).ext``, ``stem (2).ext``, … — never
+    overwrite an existing file."""
+    if not path.exists():
+        return path
+    n = 1
+    while True:
+        candidate = path.with_name(f"{path.stem} ({n}){path.suffix}")
+        if not candidate.exists():
+            return candidate
+        n += 1
+
+
 @dataclass
 class ExportResult:
     display: Display
@@ -74,7 +87,7 @@ def export_crop(
         out = crop.resize((display.native_w, display.native_h), Image.Resampling.LANCZOS)
         resampled = True
 
-    path = Path(out_dir) / filename
+    path = unique_path(Path(out_dir) / filename)
     out.save(path)
 
     upscaled = (right - left) < display.native_w or (bottom - top) < display.native_h

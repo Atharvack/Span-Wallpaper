@@ -32,7 +32,7 @@ from PySide6.QtWidgets import (
 
 from . import diaglog
 from .calibrate import DEFAULT_CELL, calibration_shift, make_crop_grid, make_grid
-from .export import export_all, safe_name
+from .export import export_all, safe_name, unique_path
 from .geometry import (
     Box,
     Display,
@@ -537,7 +537,7 @@ class SpanDialog(QDialog):
             # Render the grid at the display's NATIVE resolution → crisp, high precision.
             grid = make_crop_grid(b.x, b.y, b.w, b.h, d.native_w, d.native_h, self._cell)
             fname = f"{self._image_stem}_GRID_{safe_name(d.name)}_{d.native_w}x{d.native_h}.png"
-            path = self._out_dir / fname
+            path = unique_path(self._out_dir / fname)
             grid.save(path)
             paths.append(path)
         diaglog.log("calibrate.export", files=len(paths))

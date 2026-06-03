@@ -3,7 +3,7 @@
 import pytest
 from PIL import Image
 
-from span.export import export_all, export_crop, safe_name
+from span.export import export_all, export_crop, safe_name, unique_path
 from span.geometry import Box, Display, seed_layout
 
 
@@ -83,6 +83,26 @@ def test_export_filenames_dedup_identical_displays(tmp_path):
     results = export_all(img, displays, boxes, tmp_path, "wall")
     names = sorted(r.path.name for r in results)
     assert names == ["wall_Mon_1000x1000_0.png", "wall_Mon_1000x1000_1.png"]
+
+
+def test_unique_path_never_overwrites(tmp_path):
+    p = tmp_path / "a.png"
+    assert unique_path(p) == p                      # free → unchanged
+    p.write_bytes(b"x")
+    assert unique_path(p).name == "a (1).png"       # taken → (1)
+    (tmp_path / "a (1).png").write_bytes(b"x")
+    assert unique_path(p).name == "a (2).png"       # both taken → (2)
+
+
+def test_export_crop_does_not_overwrite(tmp_path):
+    img = Image.new("RGB", (200, 200), (1, 2, 3))
+    d = Display(0, "D", 0, 0, 1920, 1080, 1.0)
+    box = Box(0, 0, 100, 56)
+    r1 = export_crop(img, d, box, tmp_path, "x.png")
+    r2 = export_crop(img, d, box, tmp_path, "x.png")
+    assert r1.path.name == "x.png"
+    assert r2.path.name == "x (1).png"              # second run does not overwrite
+    assert r1.path.exists() and r2.path.exists()
 
 
 def test_export_filename_no_suffix_when_unique(tmp_path):

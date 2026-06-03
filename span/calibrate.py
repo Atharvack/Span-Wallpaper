@@ -19,8 +19,9 @@ from PIL import Image, ImageDraw
 
 # Source-pixel spacing between numbered (major) grid lines. Because every display's crop
 # is PPI-scaled to the same source-px/mm, one cell is the same *physical* size on each
-# monitor — so the numbers are directly comparable across the bezel.
-DEFAULT_CELL = 120
+# monitor — so the numbers are directly comparable across the bezel. Smaller = finer/more
+# precise reading at the seam.
+DEFAULT_CELL = 60
 
 
 def make_crop_grid(
