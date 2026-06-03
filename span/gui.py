@@ -365,7 +365,8 @@ class SpanDialog(QDialog):
         diaglog.log("dialog.init", image=f"{self._img_w:.0f}x{self._img_h:.0f}",
                     scene=f"{self._scene.sceneRect().width():.0f}x{self._scene.sceneRect().height():.0f}",
                     displays=len(displays))
-        seeds = seed_layout(self._displays, self._img_w, self._img_h)
+        seeds = seed_layout(self._displays, self._img_w, self._img_h,
+                            native_mode=self._native_cb.isChecked(), ppi_aware=self._ppi_aware())
         for d in self._displays:
             self._items[d.index].set_box(seeds[d.index])
             b = seeds[d.index]
@@ -400,10 +401,9 @@ class SpanDialog(QDialog):
         self.accept()
 
     def _reset(self):
-        # Back to the clean default seed (always fits). Honor 1:1 if it's on.
-        seeds = seed_layout(self._displays, self._img_w, self._img_h)
-        if self._native_cb.isChecked():
-            seeds = to_native_boxes(self._displays, seeds)
+        # Back to the clean default seed — PPI/native-aware, always fit to the image.
+        seeds = seed_layout(self._displays, self._img_w, self._img_h,
+                            native_mode=self._native_cb.isChecked(), ppi_aware=self._ppi_aware())
         self._apply_boxes(seeds)
 
     def _apply_boxes(self, boxes: Dict[int, Box]):

@@ -248,16 +248,23 @@ def test_fit_into_image_shifts_group_that_fits():
     assert out[1].x - out[0].x == pytest.approx(boxes[1].x - boxes[0].x)
 
 
-def test_fit_into_image_scales_oversized_group_to_fit():
-    # Combined arrangement (4000 wide) is wider than the image (2000) → scale to fit.
+def test_fit_into_image_oversized_keeps_size_anchors_topleft():
+    # Group (4000 wide) is wider than the image (2000): keep sizes (no scaling),
+    # anchor the top-left on-screen, let the far edge overflow.
     boxes = {0: Box(0, 0, 2000, 1000), 1: Box(2000, 0, 2000, 1000)}
     out = fit_into_image(boxes, img_w=2000, img_h=1000)
-    assert out[1].x == pytest.approx(out[0].right)              # seam preserved
-    min_x = min(b.x for b in out.values()); max_x = max(b.right for b in out.values())
-    min_y = min(b.y for b in out.values()); max_y = max(b.bottom for b in out.values())
-    assert min_x >= -1e-6 and max_x <= 2000 + 1e-6             # inside the image
-    assert min_y >= -1e-6 and max_y <= 1000 + 1e-6
-    assert out[0].w / out[0].h == pytest.approx(2000 / 1000)   # aspect preserved
+    assert out[0].w == pytest.approx(2000)             # not shrunk
+    assert out[1].x == pytest.approx(out[0].right)     # seam preserved
+    assert min(b.x for b in out.values()) >= -1e-6     # left edge on-screen
+    assert max(b.right for b in out.values()) > 2000   # far edge allowed to overflow
+
+
+def test_fit_into_image_negative_group_shifts_right():
+    boxes = {0: Box(-500, 0, 1000, 500), 1: Box(500, 0, 1000, 500)}  # 2000 wide == image
+    out = fit_into_image(boxes, img_w=2000, img_h=1000)
+    assert out[0].x == pytest.approx(0)                # left edge anchored at 0
+    assert out[1].x == pytest.approx(out[0].right)     # seam preserved
+    assert out[0].w == pytest.approx(1000)             # not scaled
 
 
 def test_to_native_boxes():

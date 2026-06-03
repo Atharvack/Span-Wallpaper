@@ -98,49 +98,63 @@ class Box:
         return (round(self.x), round(self.y), round(self.x + self.w), round(self.y + self.h))
 
 
-def seed_layout(displays: List[Display], img_w: float, img_h: float) -> Dict[int, Box]:
+def seed_layout(
+    displays: List[Display],
+    img_w: float,
+    img_h: float,
+    native_mode: bool = False,
+    ppi_aware: bool = False,
+) -> Dict[int, Box]:
     """Pre-arrange one rectangle per display over the image.
 
-    The displays' *physical* arrangement (their frames in points-space, including
-    horizontal gaps, vertical offsets, and differing sizes) is mapped onto the image so
-    that adjacent crops line up across the seam out of the box. The whole arrangement is
-    uniformly scaled to *fit* inside the image (so no seeded rectangle can start outside
-    it) and centered.
+    Lays the displays out edge-to-edge (honoring points-space gaps) with their real
+    vertical offsets, sized by :meth:`Display.unit_size` — points by default, physical
+    inches under ``ppi_aware`` (so both monitors land at the *same physical scale* across
+    the seam), or native px under ``native_mode``. The whole arrangement is uniformly
+    scaled to fit inside the image and centered.
 
     Returns a mapping of ``display.index -> Box`` in source-image pixels.
     """
     if not displays:
         return {}
 
-    min_x = min(d.x for d in displays)
-    max_x = max(d.x + d.w for d in displays)
-    min_y = min(d.y for d in displays)
-    max_y = max(d.y + d.h for d in displays)
+    ds = sorted(displays, key=lambda d: d.x)
+    sizes = {d.index: d.unit_size(native_mode, ppi_aware) for d in ds}
 
-    canvas_w = max_x - min_x
-    canvas_h = max_y - min_y
-    if canvas_w <= 0:
-        canvas_w = 1.0
-    if canvas_h <= 0:
-        canvas_h = 1.0
+    ref = ds[0]
+    upp_x = sizes[ref.index][0] / ref.w   # unit width per point (for gaps)
+    upp_y = sizes[ref.index][1] / ref.h   # unit height per point (for vertical offsets)
+
+    xpos = {ref.index: 0.0}
+    for i in range(1, len(ds)):
+        prev, cur = ds[i - 1], ds[i]
+        gap = cur.x - (prev.x + prev.w)
+        xpos[cur.index] = xpos[prev.index] + sizes[prev.index][0] + gap * upp_x
+
+    ref_top = ref.y + ref.h  # y-up top edge
+    ypos = {d.index: (ref_top - (d.y + d.h)) * upp_y for d in ds}
+
+    min_x = min(xpos.values())
+    max_x = max(xpos[d.index] + sizes[d.index][0] for d in ds)
+    min_y = min(ypos.values())
+    max_y = max(ypos[d.index] + sizes[d.index][1] for d in ds)
+    canvas_w = (max_x - min_x) or 1.0
+    canvas_h = (max_y - min_y) or 1.0
 
     # Uniform fit so the arrangement never overflows the image, then center it.
     k = min(img_w / canvas_w, img_h / canvas_h)
     off_x = (img_w - canvas_w * k) / 2.0
     off_y = (img_h - canvas_h * k) / 2.0
 
-    boxes: Dict[int, Box] = {}
-    for d in displays:
-        left = d.x - min_x
-        # Convert the display's TOP edge (y-up) into a top-down offset from the canvas top.
-        top_down = max_y - (d.y + d.h)
-        boxes[d.index] = Box(
-            x=off_x + left * k,
-            y=off_y + top_down * k,
-            w=d.w * k,
-            h=d.h * k,
+    return {
+        d.index: Box(
+            x=off_x + (xpos[d.index] - min_x) * k,
+            y=off_y + (ypos[d.index] - min_y) * k,
+            w=sizes[d.index][0] * k,
+            h=sizes[d.index][1] * k,
         )
-    return boxes
+        for d in ds
+    }
 
 
 def clamp_pos(
@@ -261,13 +275,12 @@ def align_boxes(
 def fit_into_image(
     boxes: Dict[int, Box], img_w: float, img_h: float
 ) -> Dict[int, Box]:
-    """Keep a group of boxes inside the image as a rigid unit (seam preserved).
+    """Keep a group of boxes on-screen as a rigid unit (seam and sizes preserved).
 
-    * If the group already fits, shift it the minimum amount to bring it fully inside
-      (preserving where the user placed it).
-    * If the group is larger than the image, scale the whole group down uniformly to fit
-      and center it. (Crops then fall below native and will upscale on export — that's
-      unavoidable when the source is smaller than the combined arrangement.)
+    Shift only — never scale. If the group fits, it's shifted the minimum amount to bring
+    it fully inside. If the group is larger than the image, its **top-left** is anchored
+    on-screen and the far edge is allowed to overflow (the user can nudge/resize), rather
+    than shrinking the whole arrangement.
     """
     if not boxes:
         return boxes
@@ -278,20 +291,23 @@ def fit_into_image(
     gw = max_x - min_x
     gh = max_y - min_y
 
-    if gw <= img_w and gh <= img_h:
-        dx = -min_x if min_x < 0 else (img_w - max_x if max_x > img_w else 0.0)
-        dy = -min_y if min_y < 0 else (img_h - max_y if max_y > img_h else 0.0)
-        if dx == 0.0 and dy == 0.0:
-            return boxes
-        return {i: Box(b.x + dx, b.y + dy, b.w, b.h) for i, b in boxes.items()}
+    if min_x < 0:
+        dx = -min_x                                   # bring the left edge on-screen
+    elif max_x > img_w and gw <= img_w:
+        dx = img_w - max_x                            # pull the right edge in (only if it fits)
+    else:
+        dx = 0.0
 
-    scale = min(img_w / gw if gw > 0 else 1.0, img_h / gh if gh > 0 else 1.0)
-    off_x = (img_w - gw * scale) / 2.0
-    off_y = (img_h - gh * scale) / 2.0
-    return {
-        i: Box(off_x + (b.x - min_x) * scale, off_y + (b.y - min_y) * scale, b.w * scale, b.h * scale)
-        for i, b in boxes.items()
-    }
+    if min_y < 0:
+        dy = -min_y                                   # bring the top edge on-screen
+    elif max_y > img_h and gh <= img_h:
+        dy = img_h - max_y                            # pull the bottom in (only if it fits)
+    else:
+        dy = 0.0
+
+    if dx == 0.0 and dy == 0.0:
+        return boxes
+    return {i: Box(b.x + dx, b.y + dy, b.w, b.h) for i, b in boxes.items()}
 
 
 def to_native_boxes(displays: List[Display], current: Dict[int, Box]) -> Dict[int, Box]:
