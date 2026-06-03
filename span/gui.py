@@ -31,8 +31,8 @@ from PySide6.QtWidgets import (
 )
 
 from . import diaglog
-from .calibrate import DEFAULT_CELL, calibration_shift, make_grid
-from .export import export_all
+from .calibrate import DEFAULT_CELL, calibration_shift, make_crop_grid, make_grid
+from .export import export_all, safe_name
 from .geometry import (
     Box,
     Display,
@@ -131,6 +131,7 @@ class DisplayRectItem(QGraphicsItem):
         self._w = 1.0
         self._h = 1.0
         self._locked = False
+        self._frozen = False        # calibration mode: no move/resize at all
         self._programmatic = False  # bypass the move-clamp during set_box()
 
         self.setFlags(
@@ -216,7 +217,13 @@ class DisplayRectItem(QGraphicsItem):
     def set_locked(self, locked: bool):
         """Lock to native size (1:1 mode): hide the grip and refuse resizes."""
         self._locked = locked
-        self._grip.setVisible(not locked)
+        self._grip.setVisible(not locked and not getattr(self, "_frozen", False))
+
+    def set_frozen(self, frozen: bool):
+        """Calibration mode: no move, no resize (the crop is the recommendation)."""
+        self._frozen = frozen
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, not frozen)
+        self._grip.setVisible(not frozen and not self._locked)
 
     def _reposition_children(self):
         self._grip.setPos(self._w, self._h)
@@ -329,10 +336,10 @@ class SpanDialog(QDialog):
 
         self._ppi_available = any(d.width_mm for d in displays)
 
-        reset_btn = QPushButton("Reset layout")
-        align_h_btn = QPushButton("Align ⇆ H")
+        reset_btn = self._reset_btn = QPushButton("Reset layout")
+        align_h_btn = self._align_h_btn = QPushButton("Align ⇆ H")
         align_h_btn.setToolTip("Snap rectangles edge-to-edge horizontally at a consistent scale")
-        align_v_btn = QPushButton("Align ⇅ V")
+        align_v_btn = self._align_v_btn = QPushButton("Align ⇅ V")
         align_v_btn.setToolTip("Snap rectangles to the displays' true vertical offset")
         self._native_cb = QCheckBox("1:1 native")
         self._native_cb.setToolTip("Lock each rectangle to its display's exact native pixels "
@@ -431,6 +438,10 @@ class SpanDialog(QDialog):
         return {d.index: self._items[d.index].current_box() for d in self._displays}
 
     def _apply(self):
+        if self._cal_cb.isChecked():
+            # WYSIWYG: in calibration mode Apply exports the grid you see, and stays open.
+            self._export_grid()
+            return
         self.result_boxes = self.collect_boxes()
         diaglog.log("apply", "collecting final boxes")
         for d in self._displays:
@@ -494,6 +505,11 @@ class SpanDialog(QDialog):
         diaglog.log("calibrate.mode", on=on)
         self._bg.setPixmap(self._grid_pix if on else self._photo_pix)
         self._export_grid_btn.setEnabled(on)
+        # In calibration mode the crops ARE the recommendation — no move/align/resize.
+        for d in self._displays:
+            self._items[d.index].set_frozen(on)
+        for w in (self._reset_btn, self._align_h_btn, self._align_v_btn, self._native_cb):
+            w.setEnabled(not on)
 
     def _suggest(self):
         dx, dy = calibration_shift(self._row_l.value(), self._row_r.value(),
@@ -514,14 +530,22 @@ class SpanDialog(QDialog):
         if self._out_dir is None:
             return
         self._out_dir.mkdir(parents=True, exist_ok=True)
-        results = export_all(self._grid_pil, self._displays, self.collect_boxes(),
-                             self._out_dir, self._image_stem + "_GRID")
-        diaglog.log("calibrate.export", files=len(results))
+        boxes = self.collect_boxes()
+        paths = []
+        for d in self._displays:
+            b = boxes[d.index]
+            # Render the grid at the display's NATIVE resolution → crisp, high precision.
+            grid = make_crop_grid(b.x, b.y, b.w, b.h, d.native_w, d.native_h, self._cell)
+            fname = f"{self._image_stem}_GRID_{safe_name(d.name)}_{d.native_w}x{d.native_h}.png"
+            path = self._out_dir / fname
+            grid.save(path)
+            paths.append(path)
+        diaglog.log("calibrate.export", files=len(paths))
         self._readout.setText(
-            "Calibration grids written:\n"
-            + "\n".join(f"  {r.path}" for r in results)
-            + "\n→ set as wallpapers, read where a left line meets a right line at the seam,"
-            "\n  type rows/cols (e.g. rows L:3 = R:6), then Suggest."
+            "Calibration grids written (native-res):\n"
+            + "\n".join(f"  {p}" for p in paths)
+            + "\n→ set as wallpapers; at the seam read which left row meets which right row"
+            "\n  (numbers down the edges), type rows L = R, then Suggest. Aligned when L:n = R:n."
         )
 
     def _update_readout(self):

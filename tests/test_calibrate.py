@@ -1,11 +1,18 @@
 """Tests for the calibration grid and seam-offset math."""
 
-from span.calibrate import calibration_shift, make_grid
+from span.calibrate import calibration_shift, make_crop_grid, make_grid
 
 
 def test_make_grid_dimensions():
     g = make_grid(800, 400, 100)
     assert g.size == (800, 400)
+    assert g.mode == "RGB"
+
+
+def test_make_crop_grid_renders_at_native_size():
+    # Rendered directly at native resolution (crisp), whatever the source crop region.
+    g = make_crop_grid(258.0, 205.0, 1555.0, 875.0, 1920, 1080, 120)
+    assert g.size == (1920, 1080)
     assert g.mode == "RGB"
 
 
