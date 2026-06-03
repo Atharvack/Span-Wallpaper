@@ -153,7 +153,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     # Import the GUI lazily so --list and early errors never spin up a Qt event loop.
     from .gui import run_dialog
 
-    boxes = run_dialog(image, displays)
+    boxes = run_dialog(image, displays, out_dir=out_dir, image_stem=image_path.stem)
     if boxes is None:
         diaglog.log("cli.cancelled")
         print("Cancelled — no files written.")

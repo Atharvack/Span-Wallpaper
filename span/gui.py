@@ -26,10 +26,13 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QSpinBox,
     QVBoxLayout,
 )
 
 from . import diaglog
+from .calibrate import DEFAULT_CELL, calibration_shift, make_grid
+from .export import export_all
 from .geometry import (
     Box,
     Display,
@@ -274,21 +277,31 @@ class _ImageView(QGraphicsView):
 class SpanDialog(QDialog):
     """The placement dialog. On Apply, ``result_boxes`` holds one crop Box per display."""
 
-    def __init__(self, pil_image: Image.Image, displays: List[Display]):
+    def __init__(self, pil_image: Image.Image, displays: List[Display],
+                 out_dir: Optional["Path"] = None, image_stem: str = "wallpaper"):
         super().__init__()
         self.setWindowTitle("span — place displays over the wallpaper")
-        self.resize(1100, 760)
+        self.resize(1100, 780)
 
         self._displays = displays
         self.result_boxes: Optional[Dict[int, Box]] = None
         self._img_w = float(pil_image.width)
         self._img_h = float(pil_image.height)
+        self._out_dir = out_dir
+        self._image_stem = image_stem
+        self._cell = DEFAULT_CELL
+
+        # Photo and calibration-grid backgrounds (same source-pixel space as the scene).
+        self._photo_pil = pil_image
+        self._grid_pil = make_grid(int(self._img_w), int(self._img_h), self._cell)
+        self._photo_pix = pil_to_pixmap(pil_image)
+        self._grid_pix = pil_to_pixmap(self._grid_pil)
 
         self._scene = QGraphicsScene(self)
         self._scene.setSceneRect(0, 0, self._img_w, self._img_h)
-        bg = self._scene.addPixmap(pil_to_pixmap(pil_image))
-        bg.setZValue(0)
-        bg.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
+        self._bg = self._scene.addPixmap(self._photo_pix)
+        self._bg.setZValue(0)
+        self._bg.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
 
         self._view = _ImageView(self._scene)
 
@@ -355,10 +368,48 @@ class SpanDialog(QDialog):
         buttons.addWidget(cancel_btn)
         buttons.addWidget(apply_btn)
 
+        # Calibration row: grid background, export, and seam-offset correction.
+        self._cal_cb = QCheckBox("Calibration grid")
+        self._cal_cb.setToolTip("Swap the background to a numbered grid; export it, set the "
+                                "crops as wallpapers, read the seam, then correct the offset.")
+        self._cal_cb.toggled.connect(self._toggle_calibration)
+        self._export_grid_btn = QPushButton("Export grid")
+        self._export_grid_btn.setEnabled(False)
+        self._export_grid_btn.clicked.connect(self._export_grid)
+
+        def _spin():
+            sb = QSpinBox()
+            sb.setRange(0, 9999)
+            sb.setFixedWidth(62)
+            return sb
+
+        self._row_l, self._row_r = _spin(), _spin()
+        self._col_l, self._col_r = _spin(), _spin()
+        self._suggest_btn = QPushButton("Suggest")
+        self._suggest_btn.setToolTip("Shift the right display so its grid numbers match the left")
+        self._suggest_btn.clicked.connect(self._suggest)
+
+        cal_row = QHBoxLayout()
+        cal_row.addWidget(self._cal_cb)
+        cal_row.addWidget(self._export_grid_btn)
+        cal_row.addSpacing(18)
+        cal_row.addWidget(QLabel("rows  L"))
+        cal_row.addWidget(self._row_l)
+        cal_row.addWidget(QLabel("= R"))
+        cal_row.addWidget(self._row_r)
+        cal_row.addSpacing(10)
+        cal_row.addWidget(QLabel("cols  L"))
+        cal_row.addWidget(self._col_l)
+        cal_row.addWidget(QLabel("= R"))
+        cal_row.addWidget(self._col_r)
+        cal_row.addWidget(self._suggest_btn)
+        cal_row.addStretch(1)
+
         layout = QVBoxLayout(self)
         layout.addWidget(self._view, 1)
         layout.addWidget(hint)
         layout.addWidget(self._readout)
+        layout.addLayout(cal_row)
         layout.addLayout(buttons)
 
         # Seed positions now that every item AND widget exists.
@@ -439,6 +490,40 @@ class SpanDialog(QDialog):
         else:
             self._update_readout()
 
+    def _toggle_calibration(self, on: bool):
+        diaglog.log("calibrate.mode", on=on)
+        self._bg.setPixmap(self._grid_pix if on else self._photo_pix)
+        self._export_grid_btn.setEnabled(on)
+
+    def _suggest(self):
+        dx, dy = calibration_shift(self._row_l.value(), self._row_r.value(),
+                                   self._col_l.value(), self._col_r.value(), self._cell)
+        diaglog.log("calibrate.suggest",
+                    rows=f"L{self._row_l.value()}=R{self._row_r.value()}",
+                    cols=f"L{self._col_l.value()}=R{self._col_r.value()}", dx=dx, dy=dy)
+        ds = sorted(self._displays, key=lambda d: d.x)
+        cur = self.collect_boxes()
+        for d in ds[1:]:  # nudge the right-hand display(s) to match the leftmost
+            b = cur[d.index]
+            cur[d.index] = Box(b.x + dx, b.y + dy, b.w, b.h)
+        self._apply_boxes(cur)
+        for sb in (self._row_l, self._row_r, self._col_l, self._col_r):
+            sb.setValue(0)
+
+    def _export_grid(self):
+        if self._out_dir is None:
+            return
+        self._out_dir.mkdir(parents=True, exist_ok=True)
+        results = export_all(self._grid_pil, self._displays, self.collect_boxes(),
+                             self._out_dir, self._image_stem + "_GRID")
+        diaglog.log("calibrate.export", files=len(results))
+        self._readout.setText(
+            "Calibration grids written:\n"
+            + "\n".join(f"  {r.path}" for r in results)
+            + "\n→ set as wallpapers, read where a left line meets a right line at the seam,"
+            "\n  type rows/cols (e.g. rows L:3 = R:6), then Suggest."
+        )
+
     def _update_readout(self):
         # Defensive: set_box() can fire this via itemChange before init finishes wiring up.
         if not getattr(self, "_readout", None) or not getattr(self, "_items", None):
@@ -461,10 +546,11 @@ class SpanDialog(QDialog):
         self._readout.setText("\n".join(lines))
 
 
-def run_dialog(pil_image: Image.Image, displays: List[Display]) -> Optional[Dict[int, Box]]:
+def run_dialog(pil_image: Image.Image, displays: List[Display],
+               out_dir=None, image_stem: str = "wallpaper") -> Optional[Dict[int, Box]]:
     """Open the placement dialog modally. Returns crop boxes, or None if cancelled."""
     app = QApplication.instance() or QApplication([])
-    dialog = SpanDialog(pil_image, displays)
+    dialog = SpanDialog(pil_image, displays, out_dir=out_dir, image_stem=image_stem)
     dialog.show()
     dialog.raise_()
     dialog.activateWindow()
