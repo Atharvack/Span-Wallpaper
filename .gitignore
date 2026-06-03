@@ -12,3 +12,6 @@ __pycache__/
 
 # Generated wallpaper crops (named "{stem}_{display}_{WxH}.png")
 *_*x[0-9]*.png
+
+# Diagnostic logs
+*.log

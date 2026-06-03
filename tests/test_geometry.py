@@ -5,9 +5,13 @@ import pytest
 from span.geometry import (
     Box,
     Display,
+    align_boxes,
     aspect_resize,
     clamp_pos,
     seed_layout,
+    shift_into_image,
+    target_sizes,
+    to_native_boxes,
 )
 
 
@@ -149,3 +153,103 @@ def test_aspect_resize_min_size():
     w, h = aspect_resize(100, 100, 101, 101, aspect=2.0, img_w=1000, img_h=1000, min_w=24.0)
     assert w == pytest.approx(24.0)
     assert h == pytest.approx(12.0)
+
+
+# --- PPI / physical size --------------------------------------------------------
+
+def test_ppi_from_physical_size():
+    # 1920px over 530mm ≈ 92 ppi
+    d = Display(0, "S", 0, 0, 1920, 1080, 1.0, width_mm=530.0, height_mm=298.0)
+    assert d.ppi == pytest.approx(92.0, abs=0.5)
+
+
+def test_ppi_none_without_size():
+    assert Display(0, "S", 0, 0, 1920, 1080, 1.0).ppi is None
+
+
+def test_unit_size_modes():
+    d = Display(0, "S", 0, 0, 1920, 1080, 1.0, width_mm=530.0, height_mm=298.0)  # ~92 ppi
+    assert d.unit_size(native_mode=True, ppi_aware=False) == (1920.0, 1080.0)
+    # PPI unit keeps native aspect exactly, proportional to physical size (inches).
+    uw, uh = d.unit_size(native_mode=False, ppi_aware=True)
+    assert uw / uh == pytest.approx(1920 / 1080, rel=1e-6)
+    assert uw == pytest.approx(1920 / d.ppi)
+    assert d.unit_size(native_mode=False, ppi_aware=False) == (1920.0, 1080.0)
+
+
+# --- target_sizes ---------------------------------------------------------------
+
+def _two_displays():
+    return [
+        Display(0, "L", 0, 0, 1920, 1080, 1.0),
+        Display(1, "R", 1920, -360, 2560, 1440, 1.0),  # top-aligned, taller, offset down
+    ]
+
+
+def _two_displays_ppi():
+    return [
+        Display(0, "L", 0, 0, 1920, 1080, 1.0, width_mm=530.0, height_mm=298.0),    # ~92 ppi
+        Display(1, "R", 1920, -360, 2560, 1440, 1.0, width_mm=602.0, height_mm=339.0),  # ~108 ppi
+    ]
+
+
+def test_target_sizes_native():
+    displays = _two_displays()
+    sizes = target_sizes(displays, {}, native_mode=True)
+    assert sizes[0] == pytest.approx((1920, 1080))
+    assert sizes[1] == pytest.approx((2560, 1440))
+
+
+def test_target_sizes_ppi_densest_is_native_others_downsample():
+    displays = _two_displays_ppi()
+    current = {0: Box(0, 0, 100, 56), 1: Box(0, 0, 100, 56)}
+    sizes = target_sizes(displays, current, ppi_aware=True)
+    # Densest (R, ~108 ppi) lands at native size, keeping native aspect.
+    assert sizes[1] == pytest.approx((2560, 1440), rel=2e-3)
+    # Lower-PPI L gets a larger-than-native crop (→ downsampled, never upscaled).
+    assert sizes[0][0] > 1920
+    assert sizes[0][0] / sizes[0][1] == pytest.approx(1920 / 1080, rel=1e-6)  # no distortion
+
+
+# --- align_boxes / shift / to_native -------------------------------------------
+
+def test_align_vertical_only_changes_y():
+    displays = _two_displays()
+    current = {0: Box(0, 500, 1920, 1080), 1: Box(1920, 0, 2560, 1440)}
+    out = align_boxes(displays, current, "v")
+    assert out[0].x == pytest.approx(0)        # X preserved
+    assert out[1].x == pytest.approx(1920)
+    assert out[1].w == pytest.approx(2560)     # size preserved
+    assert out[0].y == pytest.approx(500)
+    assert out[1].y == pytest.approx(500)      # tops aligned for this rig
+
+
+def test_align_horizontal_makes_edge_to_edge():
+    displays = _two_displays()
+    current = {0: Box(0, 0, 1920, 1080), 1: Box(3000, 0, 2560, 1440)}  # gap
+    out = align_boxes(displays, current, "h")
+    assert out[1].x == pytest.approx(out[0].right)   # gap closed, seam continuous
+
+
+def test_align_both_ppi_seam_continuous_and_no_distortion():
+    displays = _two_displays_ppi()
+    current = {0: Box(0, 0, 1920, 1080), 1: Box(1920, 0, 2560, 1440)}
+    out = align_boxes(displays, current, "both", ppi_aware=True)
+    assert out[1].x == pytest.approx(out[0].right, rel=1e-3)  # seam continuous
+    for b, d in ((out[0], displays[0]), (out[1], displays[1])):
+        assert b.w / b.h == pytest.approx(d.aspect, rel=1e-6)  # native aspect kept
+
+
+def test_shift_into_image_moves_group_as_unit():
+    boxes = {0: Box(-100, 50, 500, 300), 1: Box(400, 50, 500, 300)}
+    out = shift_into_image(boxes, img_w=2000, img_h=1000)
+    assert out[0].x == pytest.approx(0)         # shifted right by 100
+    assert out[1].x == pytest.approx(500)       # relative gap preserved
+    assert out[1].x - out[0].x == pytest.approx(boxes[1].x - boxes[0].x)
+
+
+def test_to_native_boxes():
+    displays = [Display(0, "S", 0, 0, 1920, 1080, 2.0)]  # native 3840x2160
+    out = to_native_boxes(displays, {0: Box(100, 100, 800, 450)})
+    assert (out[0].w, out[0].h) == pytest.approx((3840, 2160))
+    assert (out[0].x, out[0].y) == pytest.approx((100, 100))  # top-left preserved

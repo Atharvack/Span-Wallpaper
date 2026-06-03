@@ -11,6 +11,7 @@ from typing import List, Optional
 
 from PIL import Image, ImageOps, UnidentifiedImageError
 
+from . import diaglog
 from .displays import DisplayDetectionError, detect_displays
 from .export import export_all
 from .geometry import Display
@@ -77,9 +78,20 @@ def _load_image(path: Path) -> Image.Image:
         img.load()
     except (UnidentifiedImageError, OSError) as exc:
         raise SystemExit(f"error: cannot open image {path}: {exc}")
+    original_size = img.size
+    orientation = img.getexif().get(274)  # 274 = EXIF Orientation tag
     # Honor EXIF orientation so the preview and the crops match what the user sees.
     img = ImageOps.exif_transpose(img)
-    return img.convert("RGB")
+    img = img.convert("RGB")
+    diaglog.log(
+        "cli.load_image",
+        path=str(path),
+        original=f"{original_size[0]}x{original_size[1]}",
+        exif_orientation=orientation,
+        loaded=f"{img.width}x{img.height}",
+        mode=img.mode,
+    )
+    return img
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -99,6 +111,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
+
+    log_path = diaglog.enable()
+    diaglog.banner("span session start")
+    diaglog.log("cli.args", image=args.image, out=args.out, list=args.list)
+    print(f"[span] diagnostic log → {log_path}", file=sys.stderr)
 
     if args.list:
         try:
@@ -130,6 +147,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
+    diaglog.log("cli.out_dir", path=str(out_dir))
     image = _load_image(image_path)
 
     # Import the GUI lazily so --list and early errors never spin up a Qt event loop.
@@ -137,8 +155,14 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     boxes = run_dialog(image, displays)
     if boxes is None:
+        diaglog.log("cli.cancelled")
         print("Cancelled — no files written.")
         return 0
+
+    for d in displays:
+        b = boxes[d.index]
+        diaglog.log("cli.apply_box", display=repr(d.name),
+                    box=f"({b.x:.2f},{b.y:.2f} {b.w:.2f}x{b.h:.2f})", as_crop=b.as_crop())
 
     # Create the output directory only now that we will actually write to it.
     out_dir.mkdir(parents=True, exist_ok=True)

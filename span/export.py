@@ -13,6 +13,7 @@ from typing import Dict, List
 
 from PIL import Image
 
+from . import diaglog
 from .geometry import Box, Display
 
 _SAFE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -43,7 +44,8 @@ def export_crop(
     filename: str,
 ) -> ExportResult:
     """Crop ``image`` to ``box`` then resample to the display's native resolution."""
-    left, top, right, bottom = box.as_crop()
+    raw_crop = box.as_crop()
+    left, top, right, bottom = raw_crop
     # Defensive clamp to a valid in-bounds crop. The GUI already keeps boxes inside the
     # image, but export_crop is public: keep left/top strictly inside so the +1 fallbacks
     # below can never overshoot the image edge (which would crop past the bounds and
@@ -53,13 +55,31 @@ def export_crop(
     right = min(max(right, left + 1), image.width)
     bottom = min(max(bottom, top + 1), image.height)
 
+    diaglog.log(
+        "export.crop",
+        display=repr(display.name),
+        box=f"({box.x:.2f},{box.y:.2f} {box.w:.2f}x{box.h:.2f})",
+        raw_crop=raw_crop,
+        clamped=(left, top, right, bottom),
+        crop_size=(right - left, bottom - top),
+        image=f"{image.width}x{image.height}",
+        native=f"{display.native_w}x{display.native_h}",
+    )
+
     crop = image.crop((left, top, right, bottom))
-    out = crop.resize((display.native_w, display.native_h), Image.Resampling.LANCZOS)
+    if (right - left, bottom - top) == (display.native_w, display.native_h):
+        out = crop          # 1:1 — exact native pixels, zero resampling
+        resampled = False
+    else:
+        out = crop.resize((display.native_w, display.native_h), Image.Resampling.LANCZOS)
+        resampled = True
 
     path = Path(out_dir) / filename
     out.save(path)
 
     upscaled = (right - left) < display.native_w or (bottom - top) < display.native_h
+    diaglog.log("export.saved", path=path.name, out_size=out.size,
+                upscaled=upscaled, resampled=resampled)
     return ExportResult(display=display, path=path, upscaled=upscaled)
 
 
