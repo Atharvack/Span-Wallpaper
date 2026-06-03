@@ -8,8 +8,8 @@ from span.geometry import (
     align_boxes,
     aspect_resize,
     clamp_pos,
+    fit_into_image,
     seed_layout,
-    shift_into_image,
     target_sizes,
     to_native_boxes,
 )
@@ -240,12 +240,24 @@ def test_align_both_ppi_seam_continuous_and_no_distortion():
         assert b.w / b.h == pytest.approx(d.aspect, rel=1e-6)  # native aspect kept
 
 
-def test_shift_into_image_moves_group_as_unit():
+def test_fit_into_image_shifts_group_that_fits():
     boxes = {0: Box(-100, 50, 500, 300), 1: Box(400, 50, 500, 300)}
-    out = shift_into_image(boxes, img_w=2000, img_h=1000)
+    out = fit_into_image(boxes, img_w=2000, img_h=1000)
     assert out[0].x == pytest.approx(0)         # shifted right by 100
     assert out[1].x == pytest.approx(500)       # relative gap preserved
     assert out[1].x - out[0].x == pytest.approx(boxes[1].x - boxes[0].x)
+
+
+def test_fit_into_image_scales_oversized_group_to_fit():
+    # Combined arrangement (4000 wide) is wider than the image (2000) → scale to fit.
+    boxes = {0: Box(0, 0, 2000, 1000), 1: Box(2000, 0, 2000, 1000)}
+    out = fit_into_image(boxes, img_w=2000, img_h=1000)
+    assert out[1].x == pytest.approx(out[0].right)              # seam preserved
+    min_x = min(b.x for b in out.values()); max_x = max(b.right for b in out.values())
+    min_y = min(b.y for b in out.values()); max_y = max(b.bottom for b in out.values())
+    assert min_x >= -1e-6 and max_x <= 2000 + 1e-6             # inside the image
+    assert min_y >= -1e-6 and max_y <= 1000 + 1e-6
+    assert out[0].w / out[0].h == pytest.approx(2000 / 1000)   # aspect preserved
 
 
 def test_to_native_boxes():

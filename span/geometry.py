@@ -258,22 +258,40 @@ def align_boxes(
     return out
 
 
-def shift_into_image(
+def fit_into_image(
     boxes: Dict[int, Box], img_w: float, img_h: float
 ) -> Dict[int, Box]:
-    """Shift a group of boxes as a unit so it sits inside the image (seam preserved)."""
+    """Keep a group of boxes inside the image as a rigid unit (seam preserved).
+
+    * If the group already fits, shift it the minimum amount to bring it fully inside
+      (preserving where the user placed it).
+    * If the group is larger than the image, scale the whole group down uniformly to fit
+      and center it. (Crops then fall below native and will upscale on export — that's
+      unavoidable when the source is smaller than the combined arrangement.)
+    """
     if not boxes:
         return boxes
     min_x = min(b.x for b in boxes.values())
     max_x = max(b.right for b in boxes.values())
     min_y = min(b.y for b in boxes.values())
     max_y = max(b.bottom for b in boxes.values())
+    gw = max_x - min_x
+    gh = max_y - min_y
 
-    dx = -min_x if min_x < 0 else (img_w - max_x if max_x > img_w else 0.0)
-    dy = -min_y if min_y < 0 else (img_h - max_y if max_y > img_h else 0.0)
-    if dx == 0.0 and dy == 0.0:
-        return boxes
-    return {i: Box(b.x + dx, b.y + dy, b.w, b.h) for i, b in boxes.items()}
+    if gw <= img_w and gh <= img_h:
+        dx = -min_x if min_x < 0 else (img_w - max_x if max_x > img_w else 0.0)
+        dy = -min_y if min_y < 0 else (img_h - max_y if max_y > img_h else 0.0)
+        if dx == 0.0 and dy == 0.0:
+            return boxes
+        return {i: Box(b.x + dx, b.y + dy, b.w, b.h) for i, b in boxes.items()}
+
+    scale = min(img_w / gw if gw > 0 else 1.0, img_h / gh if gh > 0 else 1.0)
+    off_x = (img_w - gw * scale) / 2.0
+    off_y = (img_h - gh * scale) / 2.0
+    return {
+        i: Box(off_x + (b.x - min_x) * scale, off_y + (b.y - min_y) * scale, b.w * scale, b.h * scale)
+        for i, b in boxes.items()
+    }
 
 
 def to_native_boxes(displays: List[Display], current: Dict[int, Box]) -> Dict[int, Box]:

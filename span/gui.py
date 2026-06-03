@@ -36,8 +36,8 @@ from .geometry import (
     align_boxes,
     aspect_resize,
     clamp_pos,
+    fit_into_image,
     seed_layout,
-    shift_into_image,
     to_native_boxes,
 )
 
@@ -400,21 +400,21 @@ class SpanDialog(QDialog):
         self.accept()
 
     def _reset(self):
+        # Back to the clean default seed (always fits). Honor 1:1 if it's on.
         seeds = seed_layout(self._displays, self._img_w, self._img_h)
         if self._native_cb.isChecked():
             seeds = to_native_boxes(self._displays, seeds)
-        # Snap to a correct arrangement for the current mode (PPI / native).
-        seeds = align_boxes(
-            self._displays, seeds, "both",
-            native_mode=self._native_cb.isChecked(), ppi_aware=self._ppi_aware(),
-        )
         self._apply_boxes(seeds)
 
     def _apply_boxes(self, boxes: Dict[int, Box]):
-        # Shift the whole group back inside the image as a unit (keeps the seam intact).
-        boxes = shift_into_image(boxes, self._img_w, self._img_h)
+        # Keep the whole group inside the image as a unit (shift, or scale-to-fit if the
+        # arrangement is larger than the source). Preserves the seam.
+        boxes = fit_into_image(boxes, self._img_w, self._img_h)
         for d in self._displays:
             self._items[d.index].set_box(boxes[d.index])
+        for d in self._displays:
+            b = self._items[d.index].current_box()
+            diaglog.log("layout", name=repr(d.name), box=_fmt_box(b), as_crop=b.as_crop())
         self._update_readout()
 
     def _ppi_aware(self) -> bool:
