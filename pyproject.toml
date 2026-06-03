@@ -1,0 +1,25 @@
+[project]
+name = "span-wallpaper"
+version = "0.1.0"
+description = "Slice one wallpaper across every connected macOS display."
+requires-python = ">=3.9"
+dependencies = [
+    "pyside6",
+    "pillow",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+span = "span.cli:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["span"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

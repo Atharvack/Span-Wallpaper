@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Project-local virtualenv & caches
+.venv/
+.uv-cache/
+.pip-cache/
+.tmp/
+
+# Generated wallpaper crops (named "{stem}_{display}_{WxH}.png")
+*_*x[0-9]*.png
