@@ -405,3 +405,50 @@ def test_confirming_a_wallpaper_hides_our_own_windows_first(qapp, tmp_path, monk
     # Others hidden before the question, restored after it.
     assert calls.index("hide_others") < calls.index("dialog") < calls.index("unhide")
     assert app.windows[0].isVisible()      # reverted, so the wall comes back
+
+
+def test_revert_clears_only_the_rejected_set(qapp, tmp_path, monkeypatch):
+    """Revert is handed `pending` and nothing else, so it cannot delete a live file."""
+    from span import paths
+    from span.gui import MODE_PLACE, WallApp, WallWindow
+    from span.image_processing.export import ExportResult
+
+    monkeypatch.setenv("SPAN_HOME", str(tmp_path / "home"))
+    paths.ensure_dirs()
+
+    live = paths.wallpaper_dir() / "on-screen.png"        # from an earlier Keep
+    backup = paths.revert_dir() / "previous.png"
+    rejected = paths.pending_dir() / "just-tried.png"
+    for f in (live, backup, rejected):
+        f.write_bytes(b"x")
+
+    monkeypatch.setattr("span.gui.hide_other_applications", lambda: True)
+    monkeypatch.setattr("span.gui.unhide_all_applications", lambda: True)
+    monkeypatch.setattr("span.gui.restore", lambda before: [])       # no failures
+
+    class _Dismissed:
+        keep = False
+
+        def __init__(self, *a, **k):
+            pass
+
+        def setWindowFlag(self, *a, **k):
+            pass
+
+        def exec(self):
+            return 0
+
+    monkeypatch.setattr("span.gui.KeepDialog", _Dismissed)
+
+    state = _state(tmp_path)
+    state.mode = MODE_PLACE
+    app = WallApp(state)
+    app.windows = [WallWindow(state, 0, 1.0, app)]
+    result = ExportResult(panel=state.panels[0], path=rejected,
+                          upscaled=False, resampled=True)
+
+    app._confirm_wallpaper({"ED270U": str(live)}, [result], [])
+
+    assert live.exists(), "deleted the live wallpaper"
+    assert backup.exists(), "deleted the undo copy"
+    assert not rejected.exists(), "left the rejected image behind"

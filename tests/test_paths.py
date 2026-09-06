@@ -150,16 +150,23 @@ def test_last_image_dir_forgets_a_folder_that_has_gone(span_home, tmp_path):
     assert paths.last_image_dir() is None
 
 
-def test_wallpaper_folder_sits_inside_tmp(span_home):
-    assert paths.wallpaper_dir() == paths.tmp_dir() / "desktop_wallpaper_do_not_remove"
+def test_the_three_wallpaper_folders_are_distinct(span_home):
+    """current / pending / revert are separate so no operation can confuse them."""
+    root = paths.tmp_dir() / "desktop_wallpaper_do_not_remove"
+    assert paths.wallpaper_root() == root
+    assert paths.wallpaper_dir() == root / "current"
+    assert paths.pending_dir() == root / "pending"
+    assert paths.revert_dir() == root / "revert"
+    assert len({paths.wallpaper_dir(), paths.pending_dir(), paths.revert_dir()}) == 3
 
 
-def test_ensure_dirs_creates_the_wallpaper_folder(span_home):
+def test_ensure_dirs_creates_all_of_them(span_home):
     paths.ensure_dirs()
-    assert paths.wallpaper_dir().is_dir()
+    for d in (paths.wallpaper_dir(), paths.pending_dir(), paths.revert_dir()):
+        assert d.is_dir()
 
 
-def test_pruning_tmp_never_reaches_into_the_wallpaper_folder(span_home):
+def test_pruning_tmp_never_reaches_the_wallpaper_folders(span_home):
     """These files are what macOS references; deleting one blanks a display."""
     paths.ensure_dirs()
     live = paths.wallpaper_dir() / "on-screen.png"
@@ -174,20 +181,56 @@ def test_pruning_tmp_never_reaches_into_the_wallpaper_folder(span_home):
     assert live.exists()
 
 
-def test_prune_wallpapers_leaves_only_the_current_set(span_home):
+def test_clear_pending_cannot_reach_the_live_wallpaper(span_home):
+    """The guarantee that makes the old bug impossible: Revert is never given the paths
+    of `current` or `revert`, so no amount of wrong logic can delete them."""
     paths.ensure_dirs()
-    keep = paths.wallpaper_dir() / "new.png"
-    old = paths.wallpaper_dir() / "previous.png"
-    keep.write_bytes(b"x")
-    old.write_bytes(b"x")
+    live = paths.wallpaper_dir() / "on-screen.png"
+    backup = paths.revert_dir() / "previous.png"
+    rejected = paths.pending_dir() / "candidate.png"
+    for f in (live, backup, rejected):
+        f.write_bytes(b"x")
 
-    removed = paths.prune_wallpapers(keep=[keep])
-    assert removed == [old]
-    assert keep.exists() and not old.exists()
+    removed = paths.clear_pending()
+
+    assert removed == [rejected]
+    assert live.exists() and backup.exists()
 
 
-def test_prune_wallpapers_with_nothing_to_keep_empties_it(span_home):
+def test_promote_pending_moves_a_confirmed_set_into_current(span_home):
     paths.ensure_dirs()
-    (paths.wallpaper_dir() / "orphan.png").write_bytes(b"x")
-    paths.prune_wallpapers(keep=[])
-    assert list(paths.wallpaper_dir().iterdir()) == []
+    candidate = paths.pending_dir() / "new.png"
+    candidate.write_bytes(b"x")
+
+    promoted = paths.promote_pending([candidate])
+
+    assert promoted == [paths.wallpaper_dir() / "new.png"]
+    assert promoted[0].exists()
+    assert list(paths.pending_dir().iterdir()) == []
+
+
+def test_promote_replaces_the_set_it_supersedes(span_home):
+    paths.ensure_dirs()
+    superseded = paths.wallpaper_dir() / "old.png"
+    superseded.write_bytes(b"x")
+    candidate = paths.pending_dir() / "new.png"
+    candidate.write_bytes(b"x")
+
+    paths.promote_pending([candidate])
+
+    assert not superseded.exists()               # nothing references it any more
+    assert (paths.wallpaper_dir() / "new.png").exists()
+
+
+def test_promote_copies_the_content_not_just_the_name(span_home):
+    """Copy before delete: a half-finished move must not leave a referenced file nowhere."""
+    paths.ensure_dirs()
+    candidate = paths.pending_dir() / "new.png"
+    candidate.write_bytes(b"payload")
+
+    assert paths.promote_pending([candidate])[0].read_bytes() == b"payload"
+
+
+def test_promote_skips_a_file_that_vanished(span_home):
+    paths.ensure_dirs()
+    assert paths.promote_pending([paths.pending_dir() / "ghost.png"]) == []

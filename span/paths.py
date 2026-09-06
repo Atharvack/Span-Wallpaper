@@ -36,6 +36,7 @@ until :func:`prune_tmp` removes the oldest.
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 from typing import Iterable, List, Optional
 
@@ -70,13 +71,35 @@ def tmp_dir() -> Path:
     return home() / "tmp"
 
 
-def wallpaper_dir() -> Path:
-    """Where the images currently set as wallpaper live, and nothing else.
-
-    Separate from ``tmp`` because these files are load-bearing: macOS references them, so
-    removing one blanks that display. The long name is the warning label.
-    """
+def wallpaper_root() -> Path:
+    """Everything macOS may be referencing. The long name is the warning label."""
     return tmp_dir() / "desktop_wallpaper_do_not_remove"
+
+
+def wallpaper_dir() -> Path:
+    """The images actually on the desktop right now."""
+    return wallpaper_root() / "current"
+
+
+def pending_dir() -> Path:
+    """A newly set wallpaper that has not been confirmed yet.
+
+    Kept apart from ``current`` on purpose. When both sets shared a folder, "clear away
+    the rejected files" and "clear the folder" were the same operation, and a Revert
+    deleted the wallpaper it had just restored to. Now Revert only ever empties *this*
+    directory, so it cannot reach a live file however the code is written.
+    """
+    return wallpaper_root() / "pending"
+
+
+def revert_dir() -> Path:
+    """Copies of whatever was on the desktop before the last set.
+
+    A path alone is not a safe undo — the original can be moved, renamed, or deleted
+    between setting a new wallpaper and deciding to reject it. Holding an actual copy
+    means Revert cannot fail for want of a file.
+    """
+    return wallpaper_root() / "revert"
 
 
 def log_dir() -> Path:
@@ -95,7 +118,8 @@ def config_file() -> Path:
 
 def ensure_dirs() -> None:
     """Create the base layout. Safe to call repeatedly; ignores a read-only home."""
-    for d in (home(), tmp_dir(), wallpaper_dir(), log_dir()):
+    for d in (home(), tmp_dir(), wallpaper_root(), wallpaper_dir(), pending_dir(),
+              revert_dir(), log_dir()):
         try:
             d.mkdir(parents=True, exist_ok=True)
         except OSError:
@@ -134,16 +158,11 @@ def prune_tmp(keep: int = TMP_KEEP, protect: Optional[Iterable[Path]] = None) ->
     return removed
 
 
-def prune_wallpapers(keep: Iterable[Path]) -> List[Path]:
-    """Leave only the given files in the wallpaper folder. Returns what was removed.
-
-    Called after a new set is confirmed, so the folder holds exactly what is on screen —
-    never the previous set, which nothing references any more.
-    """
-    d = wallpaper_dir()
+def _empty(d: Path, keep: Optional[Iterable[Path]] = None) -> List[Path]:
+    """Delete the files in ``d``, except any in ``keep``. Returns what went."""
     if not d.is_dir():
         return []
-    keep_paths = {Path(p).resolve() for p in keep}
+    keep_paths = {Path(p).resolve() for p in (keep or ())}
     removed: List[Path] = []
     for f in d.iterdir():
         if not f.is_file() or f.resolve() in keep_paths:
@@ -154,6 +173,39 @@ def prune_wallpapers(keep: Iterable[Path]) -> List[Path]:
         except OSError:
             pass
     return removed
+
+
+def clear_pending() -> List[Path]:
+    """Throw away a rejected set.
+
+    The only deletion Revert performs. It cannot reach ``current`` or ``revert`` — not
+    because it is careful, but because it is not given their paths.
+    """
+    return _empty(pending_dir())
+
+
+def promote_pending(files: Iterable[Path]) -> List[Path]:
+    """Move a confirmed set from ``pending`` into ``current``. Returns the new paths.
+
+    Copy first, then remove the source: a half-finished move must not be able to leave a
+    file that macOS references in neither place.
+    """
+    wallpaper_dir().mkdir(parents=True, exist_ok=True)
+    promoted: List[Path] = []
+    for src in files:
+        src = Path(src)
+        if not src.is_file():
+            continue
+        dest = wallpaper_dir() / src.name
+        try:
+            shutil.copy2(src, dest)
+            promoted.append(dest)
+        except OSError:
+            continue
+    # Only now is it safe to drop the originals and the superseded set.
+    _empty(pending_dir())
+    _empty(wallpaper_dir(), keep=promoted)
+    return promoted
 
 
 LAST_DIR_NAME = "last-image-dir.txt"

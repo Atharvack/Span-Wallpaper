@@ -30,6 +30,8 @@ from __future__ import annotations
 import ctypes
 import ctypes.util
 import json
+import re
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -277,48 +279,148 @@ def snapshot_path() -> Path:
     return paths.tmp_dir() / SNAPSHOT_NAME
 
 
+def _backup_name(display_name: str, source: Path) -> str:
+    """A stable per-display filename, so repeated captures overwrite rather than pile up."""
+    return f"{safe_token(display_name)}{source.suffix.lower() or '.png'}"
+
+
+def safe_token(name: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-")
+    return cleaned or "display"
+
+
 def capture(path: Optional[Path] = None) -> Dict[str, str]:
-    """Record what each display is showing now, so :func:`restore` can put it back."""
+    """Record what each display is showing, and copy the files somewhere safe.
+
+    Two things are stored, because a path on its own is not a safe undo — between setting
+    a new wallpaper and rejecting it, the original can be moved, renamed, or deleted, and
+    Revert would have nothing to point at. So the snapshot keeps the original path *and*
+    an actual copy under ``tmp/revert``. :func:`restore` prefers the original, so a
+    successful undo normally leaves the user's own reference intact, and falls back to the
+    copy when it has to.
+
+    Returns the display -> original path mapping, unchanged from before, so callers that
+    only care about where things pointed keep working.
+    """
     current = current_wallpapers()
     target = Path(path) if path is not None else snapshot_path()
+
+    entries: Dict[str, Dict[str, str]] = {}
+    for display, original in current.items():
+        entry = {"path": original}
+        try:
+            src = Path(original)
+            if src.is_file():
+                paths.revert_dir().mkdir(parents=True, exist_ok=True)
+                backup = paths.revert_dir() / _backup_name(display, src)
+                shutil.copy2(src, backup)
+                entry["backup"] = str(backup)
+        except OSError as exc:
+            # A failed copy still leaves the path, which is what we had before.
+            diaglog.log("wallpaper.backup_failed", display=repr(display),
+                        source=original, error=repr(str(exc)))
+        entries[display] = entry
+
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(json.dumps(current, indent=2, sort_keys=True) + "\n",
+        target.write_text(json.dumps(entries, indent=2, sort_keys=True) + "\n",
                           encoding="utf-8")
     except OSError as exc:
         # An unwritable snapshot must not block the set — the in-memory copy is enough
         # for the confirmation dialog, which is the common case.
         diaglog.log("wallpaper.capture_failed", path=str(target), error=repr(str(exc)))
-    diaglog.log("wallpaper.captured", displays=len(current), path=str(target))
+
+    backed_up = sum(1 for e in entries.values() if "backup" in e)
+    diaglog.log("wallpaper.captured", displays=len(current), backed_up=backed_up,
+                path=str(target))
     return current
 
 
-def load_snapshot(path: Optional[Path] = None) -> Dict[str, str]:
-    """Read back a captured mapping, or ``{}`` if there is not a usable one."""
+def load_snapshot_entries(path: Optional[Path] = None) -> Dict[str, Dict[str, str]]:
+    """The snapshot as ``{display: {"path": …, "backup": …}}``.
+
+    Accepts the older flat ``{display: path}`` form too, so a snapshot written before
+    backups existed still restores.
+    """
     target = Path(path) if path is not None else snapshot_path()
     try:
         data = json.loads(target.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
-    return {str(k): str(v) for k, v in data.items() if v} if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        return {}
+
+    out: Dict[str, Dict[str, str]] = {}
+    for display, value in data.items():
+        if isinstance(value, dict) and value.get("path"):
+            out[str(display)] = {k: str(v) for k, v in value.items() if v}
+        elif isinstance(value, str) and value:
+            out[str(display)] = {"path": value}
+    return out
+
+
+def load_snapshot(path: Optional[Path] = None) -> Dict[str, str]:
+    """Read back a captured mapping of display -> original path."""
+    return {d: e["path"] for d, e in load_snapshot_entries(path).items() if e.get("path")}
 
 
 def restore(
     snapshot: Optional[Dict[str, str]] = None, path: Optional[Path] = None
 ) -> List[WallpaperResult]:
-    """Put back a captured mapping. Missing originals come back as failed results."""
-    mapping = snapshot if snapshot is not None else load_snapshot(path)
-    if not mapping:
+    """Put back what :func:`capture` recorded.
+
+    Prefers each display's original path, so a successful undo normally leaves the user's
+    own reference intact. Falls back to the copy under ``tmp/revert`` when the original
+    has gone — which is the case the copy exists for. Only when both are missing does a
+    display come back as failed.
+    """
+    if snapshot is not None:
+        entries = {d: {"path": p} for d, p in snapshot.items()}
+        # Even for a caller-supplied mapping, a stored backup is still a valid fallback.
+        for display, entry in load_snapshot_entries(path).items():
+            if display in entries and entry.get("backup"):
+                entries[display]["backup"] = entry["backup"]
+    else:
+        entries = load_snapshot_entries(path)
+    if not entries:
         return []
 
-    assignments, gone = [], []
-    for name, p in mapping.items():
-        if Path(p).exists():
-            assignments.append(Assignment(name, Path(p)))
+    assignments: List[Assignment] = []
+    gone: List[WallpaperResult] = []
+    for display, entry in entries.items():
+        original = entry.get("path", "")
+        backup = entry.get("backup", "")
+        if original and Path(original).is_file():
+            assignments.append(Assignment(display, Path(original)))
+        elif backup and Path(backup).is_file():
+            diaglog.log("wallpaper.restore_from_backup", display=repr(display),
+                        original=original, backup=backup)
+            assignments.append(Assignment(display, Path(backup)))
         else:
-            gone.append(WallpaperResult(name, Path(p), False, "original file is gone"))
+            gone.append(WallpaperResult(display, Path(original or backup), False,
+                                        "original file is gone and no backup was kept"))
 
     results = set_wallpapers(assignments) if assignments else []
     for g in gone:
-        diaglog.log("wallpaper.restore_missing", display=repr(g.display_name), path=str(g.path))
+        diaglog.log("wallpaper.restore_missing", display=repr(g.display_name),
+                    path=str(g.path))
     return results + gone
+
+
+def restored_paths(
+    snapshot: Optional[Dict[str, str]] = None, path: Optional[Path] = None
+) -> List[Path]:
+    """Every file a :func:`restore` could point at — originals and backups alike.
+
+    The caller needs this to know what *not* to delete when clearing away a rejected set.
+    """
+    entries = load_snapshot_entries(path)
+    if snapshot is not None:
+        for display, p in snapshot.items():
+            entries.setdefault(display, {})["path"] = p
+    out: List[Path] = []
+    for entry in entries.values():
+        for key in ("path", "backup"):
+            if entry.get(key):
+                out.append(Path(entry[key]))
+    return out

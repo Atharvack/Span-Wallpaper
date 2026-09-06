@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
     QLabel,
+    QMessageBox,
     QPushButton,
     QVBoxLayout,
     QWidget,
@@ -66,6 +67,7 @@ from .calibration import (
     normalize,
     pattern,
     restore,
+    restored_paths,
     set_wallpapers,
     unhide_all_applications,
 )
@@ -807,7 +809,10 @@ class WallApp:
         # Record what is showing now, before anything changes, so Revert has a target.
         before = capture()
 
-        results = self._export(paths.wallpaper_dir())
+        # Into `pending`, never straight into `current`: an unconfirmed set must not share
+        # a directory with the wallpaper that is actually on screen.
+        paths.clear_pending()
+        results = self._export(paths.pending_dir())
         if not results:
             st.message = "nothing to set"
             self.repaint_all()
@@ -828,7 +833,7 @@ class WallApp:
             self.repaint_all()
             return
 
-        self._confirm_wallpaper(before, [r.path for r in results], failed)
+        self._confirm_wallpaper(before, results, failed)
 
     def _clear_the_view(self) -> None:
         """Get everything out of the way so the wallpaper is actually visible.
@@ -856,9 +861,39 @@ class WallApp:
             self.welcome.show()
             self.welcome.raise_()
 
-    def _confirm_wallpaper(self, before, new_paths, failed) -> None:
+    def _revert_failed_dialog(self, missing, recovered: int) -> None:
+        """Tell the user plainly that Revert did not do what they asked.
+
+        Silently leaving the new wallpaper up after they pressed Revert is the worst
+        outcome: they believe they undid something they did not.
+        """
+        names = "\n".join(f"   ·  {r.display_name}" for r in missing)
+        if recovered:
+            body = (f"{recovered} display(s) went back, but these could not:\n\n{names}\n\n"
+                    "They are still showing the new wallpaper.")
+        else:
+            body = (f"These displays could not be put back:\n\n{names}\n\n"
+                    "The wallpaper they were showing no longer exists on disk, and no "
+                    "backup copy was made — it was already missing when you pressed Set.\n\n"
+                    "The new wallpaper has been kept, since removing it would leave you "
+                    "with no wallpaper at all.")
+
+        box = QMessageBox()
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Revert failed")
+        box.setText("Could not restore your previous wallpaper")
+        box.setInformativeText(body)
+        box.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        box.setStyleSheet("QMessageBox { background: #12131C; }"
+                          "QLabel { color: #ECEFF8; font-size: 13px; }"
+                          "QPushButton { padding: 6px 18px; }")
+        diaglog.log("gui.revert_failed_dialog", missing=len(missing), recovered=recovered)
+        box.exec()
+
+    def _confirm_wallpaper(self, before, results, failed) -> None:
         """Ask whether to keep it. Doing nothing reverts — that is what the timer is for."""
         st = self.state
+        new_paths = [r.path for r in results]
         self._clear_the_view()
         # No parent: the dialog has to outlive the windows we just hid, and float over a
         # bare desktop as the only thing on screen.
@@ -867,9 +902,15 @@ class WallApp:
         dialog.exec()
 
         if dialog.keep:
-            # Leave only what is actually on screen: the previous set is referenced by
-            # nothing now, and macOS only holds a reference to the current one.
-            paths.prune_wallpapers(keep=new_paths)
+            # Promote out of `pending` into `current`, then re-point macOS at the new
+            # location. promote_pending copies before it deletes, and the displays are
+            # re-set before the originals go, so the reference is never left dangling.
+            promoted = paths.promote_pending([r.path for r in results])
+            if promoted:
+                moved = [(r.panel.name, p) for r, p in zip(results, promoted)]
+                outcome = set_wallpapers(assignments_from_exports(moved))
+                failed += [o for o in outcome if not o.ok]
+                new_paths = promoted
             paths.prune_tmp()
             self.exported = list(new_paths)
             note = ""
@@ -885,15 +926,29 @@ class WallApp:
 
         restored = restore(before)
         missing = [r for r in restored if not r.ok]
-        st.message = ("reverted to your previous wallpaper" if not missing else
-                      "reverted, except: " + ", ".join(
-                          f"{r.display_name} ({r.error})" for r in missing))
-        diaglog.log("gui.wallpaper_reverted", restored=len(restored) - len(missing),
-                    missing=len(missing))
+        recovered = len(restored) - len(missing)
+        diaglog.log("gui.wallpaper_reverted", restored=recovered, missing=len(missing))
+
+        if missing:
+            # Saying "reverted" here would be a lie: those displays are still showing the
+            # new wallpaper. Name what could not be put back, and what you are left with.
+            names = ", ".join(r.display_name for r in missing)
+            if recovered:
+                st.message = (f"partly reverted — {names} could not be restored and "
+                              "still shows the new wallpaper")
+            else:
+                st.message = ("could not revert — the previous wallpaper no longer "
+                              "exists on disk. Keeping the new one.")
+                self.exported = list(new_paths)   # these are the live wallpaper now
+            self._revert_failed_dialog(missing, recovered)
         # Reverted, so the images we just wrote are referenced by nothing — but only clear
         # them if the restore actually took, or we would delete what is still on screen.
         if not missing:
-            paths.prune_wallpapers(keep=[])
+            # The rejected set, and only the rejected set. `current` and `revert` are not
+            # reachable from here — that separation is what makes the old bug impossible
+            # rather than merely guarded against.
+            paths.clear_pending()
+        # If anything failed to restore, the pending files are still on screen: leave them.
         paths.prune_tmp()
         self._restore_the_view(show_wall=True)
         self.repaint_all()
