@@ -110,6 +110,7 @@ def test_protected_files_survive_pruning_regardless_of_age(span_home):
 def test_base_is_the_checkout_when_running_from_source(monkeypatch):
     """Working in the repo, the files belong beside the code — visible and tailable."""
     monkeypatch.delenv("SPAN_HOME", raising=False)
+    monkeypatch.delenv("SPAN_DIAG_LOG", raising=False)   # conftest points this at a tmp
     root = paths.project_root()
     assert root is not None and (root / "pyproject.toml").is_file()
     assert paths.home() == root

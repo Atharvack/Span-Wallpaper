@@ -126,6 +126,34 @@ QPushButton#primary {
 QPushButton#primary:hover { background: rgba(112, 152, 245, 245); }
 """
 
+# Welcome-screen status callout. The tint carries the state before the words are read:
+# amber means something is stopping you, blue means go.
+_CALLOUT = """
+QLabel {{
+    background: rgba({tint}, 30);
+    border: 1px solid rgba({tint}, 90);
+    border-left: 4px solid rgb({tint});
+    border-radius: 8px;
+    padding: 16px 20px;
+    color: #ECEFF8;
+    font-size: 13.5px;
+}}
+"""
+CALLOUT_BLOCKED = _CALLOUT.format(tint="255, 176, 76")
+CALLOUT_READY = _CALLOUT.format(tint="90, 130, 230")
+
+PANEL_CARD = """
+QLabel {
+    background: rgba(255, 255, 255, 10);
+    border: 1px solid rgba(140, 148, 176, 60);
+    border-radius: 8px;
+    padding: 14px 18px;
+    font-family: Menlo, monospace;
+    font-size: 12.5px;
+    color: #C3C7D6;
+}
+"""
+
 
 def pil_to_qimage(img: Image.Image) -> QImage:
     """Convert a PIL image to a QImage over identical pixel data."""
@@ -158,11 +186,11 @@ class WelcomeWindow(QWidget):
         subtitle.setStyleSheet("font-size: 14px; color: #8B90A6;")
 
         self._displays = QLabel()
-        self._displays.setStyleSheet(
-            "font-family: Menlo, monospace; font-size: 12px; color: #C3C7D6;")
+        self._displays.setStyleSheet(PANEL_CARD)
+        self._displays.setTextFormat(Qt.TextFormat.RichText)
         self._status = QLabel()
         self._status.setWordWrap(True)
-        self._status.setStyleSheet("font-size: 13.5px; color: #ECEFF8;")
+        self._status.setTextFormat(Qt.TextFormat.RichText)
 
         self._browse = QPushButton("Browse image…")
         self._browse.setDefault(True)
@@ -197,34 +225,64 @@ class WelcomeWindow(QWidget):
 
     def refresh(self) -> None:
         st = self.state
-        rows = []
-        for p in st.panels:
-            rows.append(f"{p.name:<16} {p.px_w}×{p.px_h}   {p.ppi:5.1f} ppi   "
-                        f"{p.width_mm:6.1f} × {p.height_mm:5.1f} mm")
-        self._displays.setText("\n".join(rows))
-
-        calibrated = st.config.is_measured
+        calibrated = st.is_calibrated
         has_image = st.image is not None
+
+        rows = []
+        for i, p in enumerate(st.panels):
+            offset = (f"<span style='color:#5A82E6'>{p.y_mm:+.1f} mm</span>"
+                      if calibrated and i else
+                      "<span style='color:#7E849A'>—</span>")
+            rows.append(
+                f"<b style='color:#ECEFF8'>{p.name}</b>"
+                f"&nbsp;&nbsp;{p.px_w}×{p.px_h}"
+                f"&nbsp;&nbsp;<span style='color:#8B90A6'>{p.ppi:.0f} ppi</span>"
+                f"&nbsp;&nbsp;{p.width_mm:.0f}×{p.height_mm:.0f} mm"
+                f"&nbsp;&nbsp;{offset}"
+            )
+        self._displays.setText("<br>".join(rows))
+
         self._place.setEnabled(has_image and calibrated)
+        self._place.setToolTip("" if calibrated else
+                               "Calibrate the wall first — crops would step at the seam.")
 
         if not calibrated:
+            # Say what is blocked, not just what is missing. With an image loaded the
+            # answer to "why can't I set this?" has to be right there.
+            headline = ("Can’t set a wallpaper yet — calibrate first"
+                        if has_image else "This wall is not calibrated")
+            loaded = (f"<br><br><span style='color:#8B90A6'>Loaded "
+                      f"{st.image_stem} · {st.image.width}×{st.image.height}</span>"
+                      if has_image else "")
+            self._status.setStyleSheet(CALLOUT_BLOCKED)
             self._status.setText(
-                "This wall has not been calibrated yet.\n"
-                "Until it is, crops are laid out as though your panels were flush and "
-                "touching — which is exactly what makes a spanned image step at the seam. "
-                "Calibration is a one-off measurement per desk."
+                f"<b style='font-size:15px'>{headline}</b><br><br>"
+                "Crops are currently laid out as though your panels were flush and "
+                "touching. That is exactly what makes a spanned image step at the seam — "
+                "so <b>Set wallpaper</b> stays blocked until the wall is measured.<br><br>"
+                "It takes a minute, once per desk."
+                f"{loaded}"
             )
             self._calibrate.setText("Start calibration")
-            self._calibrate.setDefault(not has_image)
-        elif has_image:
-            self._status.setText(
-                f"Loaded {st.image_stem}  ({st.image.width}×{st.image.height})  ·  "
-                "wall calibrated. Place it across your displays."
-            )
-            self._calibrate.setText("Re-calibrate")
+            self._calibrate.setDefault(True)
+            self._browse.setDefault(not has_image)
         else:
-            self._status.setText("Wall calibrated. Choose an image to get started.")
+            self._status.setStyleSheet(CALLOUT_READY)
+            if has_image:
+                self._status.setText(
+                    "<b style='font-size:15px'>Ready to place</b><br><br>"
+                    f"<span style='color:#8B90A6'>{st.image_stem} · "
+                    f"{st.image.width}×{st.image.height}</span><br>"
+                    "Wall calibrated — the image will run continuously across the bezel."
+                )
+            else:
+                self._status.setText(
+                    "<b style='font-size:15px'>Wall calibrated</b><br><br>"
+                    "Choose an image to span across your displays."
+                )
             self._calibrate.setText("Re-calibrate")
+            self._calibrate.setDefault(False)
+            self._browse.setDefault(not has_image)
 
 
 class KeepDialog(QDialog):
@@ -307,6 +365,41 @@ class AppState:
     offset_mm: Tuple[float, float] = (0.0, 0.0)
     pattern_mode: int = 0
     message: str = ""
+    saved_config: Optional[WallConfig] = None
+
+    def __post_init__(self) -> None:
+        # What is on disk, held separately from the working copy. Nudging has to move the
+        # pattern immediately — that is the whole point — but a nudge is not a decision,
+        # and until it is saved nothing downstream should treat it as measured geometry.
+        if self.saved_config is None:
+            self.saved_config = WallConfig(
+                y_offsets_mm=list(self.config.y_offsets_mm),
+                gaps_mm=list(self.config.gaps_mm),
+                note=self.config.note,
+            )
+
+    @property
+    def dirty(self) -> bool:
+        """True when the working copy differs from what was last saved."""
+        s = self.saved_config
+        return (list(self.config.y_offsets_mm) != list(s.y_offsets_mm)
+                or list(self.config.gaps_mm) != list(s.gaps_mm))
+
+    @property
+    def is_calibrated(self) -> bool:
+        """Only a *saved* measurement counts. An unsaved nudge is not a calibration."""
+        return self.saved_config.is_measured
+
+    def mark_saved(self) -> None:
+        self.saved_config = WallConfig(
+            y_offsets_mm=list(self.config.y_offsets_mm),
+            gaps_mm=list(self.config.gaps_mm),
+            note=self.config.note,
+        )
+
+    def discard_changes(self) -> None:
+        self.config.y_offsets_mm = list(self.saved_config.y_offsets_mm)
+        self.config.gaps_mm = list(self.saved_config.gaps_mm)
 
     @property
     def panels(self) -> List[Panel]:
@@ -481,7 +574,8 @@ class WallWindow(QWidget):
         p.setPen(QPen(HUD))
 
         gap = st.config.gaps_mm[0] if st.config.gaps_mm else 0.0
-        line2 = (f"[{st.mode}]   y_mm {pan.y_mm:+.2f}   gap {gap:.2f} mm")
+        unsaved = "   ●  UNSAVED" if st.mode == MODE_CALIBRATE and st.dirty else ""
+        line2 = (f"[{st.mode}]   y_mm {pan.y_mm:+.2f}   gap {gap:.2f} mm{unsaved}")
         if st.mode == MODE_PLACE and st.image is not None:
             plan = st.plan()
             if plan is not None:
@@ -504,9 +598,8 @@ class WallWindow(QWidget):
         f.setPointSizeF(11.5)
         p.setFont(f)
         if st.mode == MODE_CALIBRATE:
-            keys = ("tab place  ·  click a screen to control it  ·  ↑↓ this panel 1 mm  ·  "
-                    "←→ bezel gap  ·  shift finer  ·  g pattern  ·  o open image  ·  "
-                    "⏎ save  ·  esc back")
+            keys = ("drag the pattern  ·  ↑↓ nudge 1 mm  ·  ←→ bezel gap  ·  shift finer"
+                    "  ·  g pattern  ·  ⏎ SAVE CALIBRATION  ·  tab place  ·  esc back")
             y = self.height() - 34
         else:
             # Shortcuts for the same three actions the buttons offer, plus the framing
@@ -519,14 +612,27 @@ class WallWindow(QWidget):
     # -- interaction ------------------------------------------------------------------
     def mousePressEvent(self, event):
         self.app.set_focus(self.slot)
+        self._drag_from = event.position()
         if self.state.mode == MODE_PLACE:
-            self._drag_from = event.position()
             self._drag_offset = self.state.offset_mm
-            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        else:
+            # Calibrating: drag this panel's pattern directly. Nudging a millimetre at a
+            # time is right for the last few tenths, but useless for the first 60 mm.
+            self._drag_offset = (0.0, self.state.config.y_offsets_mm[self.slot])
+        self.setCursor(Qt.CursorShape.ClosedHandCursor)
         self.app.repaint_all()
 
     def mouseMoveEvent(self, event):
-        if self._drag_from is None or self.state.mode != MODE_PLACE:
+        if self._drag_from is None:
+            return
+        if self.state.mode == MODE_CALIBRATE:
+            # Drag down, pattern goes down. Screen y grows downward while a larger y_mm
+            # moves the pattern up, hence the subtraction.
+            dy_mm = (event.position().y() - self._drag_from.y()) / self.k()
+            offsets = list(self.state.config.y_offsets_mm)
+            offsets[self.slot] = self._drag_offset[1] - dy_mm
+            self.state.config.y_offsets_mm = normalize(offsets)
+            self.app.repaint_all()
             return
         # Drag in this panel's logical px -> wall mm. Moving the mouse right slides the
         # image right, which is an increase in the image's wall origin.
@@ -598,8 +704,49 @@ class WallApp:
         self.windows[0].setFocus()
         diaglog.log("gui.wall_open", mode=mode, displays=len(self.windows))
 
+    def confirm_discard(self) -> bool:
+        """Ask before throwing away unsaved calibration. True means carry on.
+
+        Nudging has to move the pattern live, so the working copy changes as you go — but
+        walking away from that silently would lose a measurement someone spent minutes on,
+        with nothing on screen having said it was unsaved.
+        """
+        st = self.state
+        if st.mode != MODE_CALIBRATE or not st.dirty:
+            return True
+
+        box = QMessageBox()
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Unsaved calibration")
+        box.setText("Save this calibration?")
+        box.setInformativeText(
+            "The pattern has been adjusted but not saved. Nothing uses these numbers "
+            "until you do — setting a wallpaper will still be blocked."
+        )
+        box.setStandardButtons(QMessageBox.StandardButton.Save
+                               | QMessageBox.StandardButton.Discard
+                               | QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(QMessageBox.StandardButton.Save)
+        box.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        box.setStyleSheet("QMessageBox { background: #12131C; }"
+                          "QLabel { color: #ECEFF8; font-size: 13px; }"
+                          "QPushButton { padding: 6px 18px; }")
+        choice = box.exec()
+
+        if choice == QMessageBox.StandardButton.Save:
+            self._commit()
+            return True
+        if choice == QMessageBox.StandardButton.Discard:
+            st.discard_changes()
+            st.message = "calibration changes discarded"
+            diaglog.log("gui.calibration_discarded")
+            return True
+        return False        # Cancel: stay in calibration
+
     def close_wall(self) -> None:
         """Take the wall down and come back to the welcome window."""
+        if not self.confirm_discard():
+            return
         for w in self.windows:
             w.close()
         self.windows = []
@@ -614,7 +761,7 @@ class WallApp:
         """Pick an image, then go wherever that leaves us: calibrate, or place."""
         if not self.open_image():
             return
-        if self.state.config.is_measured:
+        if self.state.is_calibrated:
             self.open_wall(MODE_PLACE)
         elif self.welcome is not None:
             # Not calibrated: stay on the welcome screen, which now explains why and
@@ -635,12 +782,12 @@ class WallApp:
             self.open_image()
             return
         if key == Qt.Key.Key_Tab:
+            if not self.confirm_discard():      # leaving calibration is leaving it
+                return
             st.mode = MODE_PLACE if st.mode == MODE_CALIBRATE else MODE_CALIBRATE
             if st.mode == MODE_PLACE and st.image is None:
                 st.mode = MODE_CALIBRATE
                 st.message = "no image loaded — press o to choose one"
-            else:
-                st.message = ""
             self.repaint_all()
             return
         if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
@@ -662,10 +809,13 @@ class WallApp:
             return
         offsets = list(st.config.y_offsets_mm)
         gaps = list(st.config.gaps_mm)
+        # The pattern is drawn at (wall_mm - panel.y_mm) * k, so a *larger* y_mm shows
+        # content from further down the wall and the image moves UP on screen. Arrow keys
+        # follow what you can see, not the sign of the underlying field.
         if key == Qt.Key.Key_Up:
-            offsets[slot] -= step
-        elif key == Qt.Key.Key_Down:
             offsets[slot] += step
+        elif key == Qt.Key.Key_Down:
+            offsets[slot] -= step
         elif key == Qt.Key.Key_Left and gaps:
             gaps[0] = max(0.0, gaps[0] - step)
         elif key == Qt.Key.Key_Right and gaps:
@@ -797,7 +947,7 @@ class WallApp:
             st.message = "nothing to set — press o to open an image"
             self.repaint_all()
             return
-        if not st.config.is_measured:
+        if not st.is_calibrated:
             st.mode = MODE_CALIBRATE
             st.message = ("calibrate first — this wall has no measured geometry, so the "
                           "crops would step at the seam. Nudge until the pattern joins, "
@@ -956,8 +1106,12 @@ class WallApp:
     def _commit(self) -> None:
         st = self.state
         if st.mode == MODE_CALIBRATE:
-            path = save_config(signature(st.displays), st.config)
-            st.message = f"saved wall calibration → {path}"
+            save_config(signature(st.displays), st.config)
+            st.mark_saved()          # only now does this count as a measurement
+            st.message = ("calibration saved — "
+                          + ", ".join(f"{o:+.2f} mm" for o in st.config.y_offsets_mm[1:])
+                          + (f", gap {st.config.gaps_mm[0]:.2f} mm"
+                             if st.config.gaps_mm else ""))
             diaglog.log("gui.calibration_saved", y=st.config.y_offsets_mm,
                         gaps=st.config.gaps_mm)
         else:

@@ -257,12 +257,37 @@ def _state(tmp_path, calibrated=True, image=True):
 def test_welcome_explains_why_calibration_comes_first(qapp, tmp_path):
     from span.gui import WallApp, WelcomeWindow
 
-    state = _state(tmp_path, calibrated=False)
-    app = WallApp(state)
-    w = WelcomeWindow(state, app)
-    assert "not been calibrated" in w._status.text()
+    state = _state(tmp_path, calibrated=False, image=False)
+    w = WelcomeWindow(state, WallApp(state))
+    assert "not calibrated" in w._status.text()
+    assert "seam" in w._status.text()
     assert w._calibrate.text() == "Start calibration"
     assert not w._place.isEnabled()      # placing would produce a stepped result
+
+
+def test_welcome_says_what_is_blocked_once_an_image_is_loaded(qapp, tmp_path):
+    """With an image in hand, "why can't I set this?" needs answering on the spot."""
+    from span.gui import WallApp, WelcomeWindow
+
+    state = _state(tmp_path, calibrated=False, image=True)
+    w = WelcomeWindow(state, WallApp(state))
+    text = w._status.text()
+    assert "set a wallpaper" in text and "calibrate first" in text
+    assert not w._place.isEnabled()
+    assert "Calibrate the wall first" in w._place.toolTip()
+
+
+def test_welcome_switches_to_ready_once_calibrated(qapp, tmp_path):
+    from span.gui import WallApp, WelcomeWindow
+
+    blocked = WelcomeWindow(_state(tmp_path, calibrated=False, image=True),
+                            WallApp(_state(tmp_path, calibrated=False)))
+    ready = WelcomeWindow(_state(tmp_path, calibrated=True, image=True),
+                          WallApp(_state(tmp_path, calibrated=True)))
+
+    assert "Ready to place" in ready._status.text()
+    # The tint carries the state before the words are read.
+    assert blocked._status.styleSheet() != ready._status.styleSheet()
 
 
 def test_welcome_offers_placement_once_calibrated(qapp, tmp_path):
@@ -280,7 +305,8 @@ def test_welcome_lists_the_detected_panels(qapp, tmp_path):
     state = _state(tmp_path)
     text = WelcomeWindow(state, WallApp(state))._displays.text()
     assert "ED270U" in text and "Sceptre" in text
-    assert "108.0 ppi" in text
+    assert "108 ppi" in text
+    assert "+67.2 mm" in text          # the measured offset, shown once calibrated
 
 
 def test_place_is_refused_without_an_image(qapp, tmp_path):
@@ -363,6 +389,7 @@ def test_set_wallpaper_button_goes_through_the_calibration_gate(qapp, tmp_path,
                         lambda *a, **k: pytest.fail("should not reach the OS"))
     state, app, win = _wall(tmp_path, MODE_PLACE)
     state.config = WallConfig(y_offsets_mm=[0.0, 0.0], gaps_mm=[0.0])   # uncalibrated
+    state.saved_config = WallConfig(y_offsets_mm=[0.0, 0.0], gaps_mm=[0.0])
     win._set_btn.click()
     assert state.mode == MODE_CALIBRATE
     assert "calibrate first" in state.message
@@ -452,3 +479,73 @@ def test_revert_clears_only_the_rejected_set(qapp, tmp_path, monkeypatch):
     assert live.exists(), "deleted the live wallpaper"
     assert backup.exists(), "deleted the undo copy"
     assert not rejected.exists(), "left the rejected image behind"
+
+
+# --- unsaved calibration ----------------------------------------------------------
+
+def test_nudging_does_not_count_as_calibrated_until_saved(qapp, tmp_path):
+    """One arrow key used to flip is_measured, opening the wallpaper gate on numbers
+    nobody had committed to."""
+    from span.gui import MODE_CALIBRATE, WallApp
+
+    state = _state(tmp_path, calibrated=False)
+    state.mode = MODE_CALIBRATE
+    app = WallApp(state)
+
+    app._calibrate_key(Qt.Key.Key_Up, fine=False, slot=1)
+
+    assert state.dirty
+    assert not state.is_calibrated          # the gate stays shut
+    assert state.config.y_offsets_mm != state.saved_config.y_offsets_mm
+
+
+def test_saving_makes_it_count(qapp, tmp_path, monkeypatch):
+    from span.gui import MODE_CALIBRATE, WallApp
+
+    saved = {}
+    monkeypatch.setattr("span.gui.save_config",
+                        lambda sig, cfg: saved.setdefault("cfg", cfg) or tmp_path / "w.json")
+    state = _state(tmp_path, calibrated=False)
+    state.mode = MODE_CALIBRATE
+    app = WallApp(state)
+
+    app._calibrate_key(Qt.Key.Key_Up, fine=False, slot=1)
+    app._commit()
+
+    assert not state.dirty
+    assert state.is_calibrated
+    assert "cfg" in saved                   # and it reached disk
+
+
+def test_discarding_restores_the_saved_numbers(qapp, tmp_path):
+    from span.gui import MODE_CALIBRATE, WallApp
+
+    state = _state(tmp_path, calibrated=True)
+    state.mode = MODE_CALIBRATE
+    before = list(state.config.y_offsets_mm)
+    app = WallApp(state)
+
+    app._calibrate_key(Qt.Key.Key_Down, fine=False, slot=1)
+    assert state.dirty
+    state.discard_changes()
+
+    assert state.config.y_offsets_mm == before
+    assert not state.dirty
+
+
+def test_up_arrow_moves_the_pattern_up(qapp, tmp_path):
+    """Screen y grows downward while a larger y_mm moves the pattern up; the key follows
+    what you see, not the sign of the field."""
+    from span.gui import MODE_CALIBRATE, WallApp
+
+    state = _state(tmp_path, calibrated=False)
+    state.mode = MODE_CALIBRATE
+    app = WallApp(state)
+    start = state.panels[1].y_mm
+
+    app._calibrate_key(Qt.Key.Key_Up, fine=False, slot=1)
+    assert state.panels[1].y_mm > start      # larger y_mm == pattern higher on screen
+
+    app._calibrate_key(Qt.Key.Key_Down, fine=False, slot=1)
+    app._calibrate_key(Qt.Key.Key_Down, fine=False, slot=1)
+    assert state.panels[1].y_mm < start
