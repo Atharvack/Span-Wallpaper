@@ -256,5 +256,17 @@ anywhere. The GUI is constructed under Qt's offscreen platform.
 ## Output confinement
 
 If `SPAN_ROOT` is set, `--out` must resolve inside it (default output is `SPAN_ROOT`
-itself). Otherwise output defaults to the current directory. The directory is created only
-when files are actually written, so quitting without exporting leaves nothing behind.
+itself). Otherwise output defaults to `tmp/`. The directory is created only when files are
+actually written, so quitting without exporting leaves nothing behind.
+
+## Licence
+
+Copyright © 2026 Atharva Kulkarni. Released under the
+[GNU General Public License v3.0](LICENSE).
+
+In short: use it, study it, change it, share it. If you distribute span — modified or not
+— you must pass on the source under the same licence, so whoever receives it has the same
+freedoms you did.
+
+Contributions are welcome and go through pull requests; only merged changes become part of
+the project.
