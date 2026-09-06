@@ -20,3 +20,8 @@ __pycache__/
 /tmp/
 /logs/
 
+
+# never let generated images land in the package
+/span/**/*.png
+/span/**/*.jpg
+/span/**/*.jpeg
