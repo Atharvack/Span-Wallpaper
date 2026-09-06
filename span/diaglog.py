@@ -1,9 +1,15 @@
 """Diagnostic logging for tracing the full span flow.
 
-Built on the stdlib :mod:`logging`. Inactive until :func:`enable` is called (the CLI
-calls it; or set ``SPAN_DIAG=1``). Streams to ``<project>/span-diag.log`` (override with
-``SPAN_DIAG_LOG``) and mirrors every line to stderr, flushing each record so the file can
-be tailed / monitored live.
+Built on the stdlib :mod:`logging`. Inactive until :func:`enable` is called (the CLI calls
+it; or set ``SPAN_DIAG=1``). Appends to ``~/.span/logs/span.log`` — one continuous file
+across every session, never truncated — and mirrors each line to stderr.
+
+Every record is flushed as it is written, so the file can be watched live:
+
+    tail -f ~/.span/logs/span.log
+
+Flushing per record costs performance a tool writing a handful of PNGs will never notice,
+and buys the ability to watch a geometry bug happen in real time.
 """
 
 from __future__ import annotations
@@ -13,16 +19,16 @@ import os
 from pathlib import Path
 from typing import Optional
 
+from . import paths
+
 _logger = logging.getLogger("span.diag")
 _on = False
 _configured = False
 
 
 def default_log_path() -> Path:
-    override = os.environ.get("SPAN_DIAG_LOG")
-    if override:
-        return Path(override).expanduser()
-    return Path(__file__).resolve().parent.parent / "span-diag.log"
+    """``~/.span/logs/span.log``, or ``$SPAN_DIAG_LOG`` if set."""
+    return paths.log_file()
 
 
 class _FlushingFileHandler(logging.FileHandler):

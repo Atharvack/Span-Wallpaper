@@ -1,583 +1,859 @@
-"""PySide6 dialog: place one aspect-locked rectangle per display over the image.
+"""The app: the wall, live across every display.
 
-The ``QGraphicsScene`` holds the source image at full resolution, so scene coordinates
-*are* source-image pixels and every rectangle's geometry is an exact crop box. The view
-``fitInView``s the whole scene into the window (re-fit on resize). Labels and resize
-grips use ``ItemIgnoresTransformations`` so they stay a constant on-screen size no matter
-how far the image is zoomed to fit.
+One fullscreen window per panel. Each renders the shared wall through its own pixel
+density, so what you see *is* the export — the rectangle drawn on screen is literally the
+crop box handed to Pillow.
+
+    window_px = (wall_mm - panel.origin_mm) * panel.px_per_mm
+
+Two modes, because there are two different unknowns:
+
+* **calibrate** — where the glass physically is. A fact about your room, measured once by
+  eye and stored. Nudge until the pattern joins across the bezel.
+* **place** — where you want the picture. A preference. Drag the image behind the fixed
+  panels; the panels never move, because they cannot.
+
+The panels being immovable is the point. Earlier versions let you drag rectangles over an
+image, which had it backwards: monitors are fixed, the poster is what slides.
 """
 
 from __future__ import annotations
 
-from typing import Callable, Dict, List, Optional
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 from PIL import Image
-from PySide6.QtCore import QPointF, QRectF, Qt
-from PySide6.QtGui import QBrush, QColor, QFont, QImage, QPainter, QPen, QPixmap
+from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
+from PySide6.QtGui import (
+    QColor,
+    QFont,
+    QGuiApplication,
+    QImage,
+    QPainter,
+    QPen,
+)
 from PySide6.QtWidgets import (
     QApplication,
-    QCheckBox,
     QDialog,
-    QGraphicsItem,
-    QGraphicsRectItem,
-    QGraphicsScene,
-    QGraphicsSimpleTextItem,
-    QGraphicsView,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
     QPushButton,
-    QSpinBox,
     QVBoxLayout,
+    QWidget,
 )
 
-from . import diaglog
-from .calibrate import DEFAULT_CELL, calibration_shift, make_crop_grid, make_grid
-from .export import export_all, safe_name, unique_path
-from .geometry import (
-    Box,
+from . import diaglog, paths
+from .algorithm import (
     Display,
-    align_boxes,
-    aspect_resize,
-    clamp_pos,
-    fit_into_image,
-    seed_layout,
-    to_native_boxes,
+    Panel,
+    Plan,
+    choose_scale,
+    clamp_offset,
+    estate,
+    panels_from_displays,
+    plan_layout,
+    seam_positions,
+    signature,
+)
+from .calibration import (
+    WallConfig,
+    WallpaperError,
+    assignments_from_exports,
+    capture,
+    normalize,
+    pattern,
+    restore,
+    set_wallpapers,
+)
+from .calibration import save as save_config
+
+KEEP_SECONDS = 60
+from .image_processing import ImageLoadError, export_all, load_image
+
+IMAGE_FILTER = (
+    "Images (*.png *.jpg *.jpeg *.heic *.heif *.tif *.tiff *.webp *.bmp *.gif);;"
+    "All files (*)"
 )
 
+BG = QColor(10, 10, 16)
+HUD = QColor(236, 239, 248)
+HUD_DIM = QColor(126, 132, 154)
+HUD_KEY = QColor(90, 130, 230)
+WARN = QColor(255, 176, 76)
 
-def _fmt_box(b: Box) -> str:
-    return f"({b.x:.2f},{b.y:.2f} {b.w:.2f}x{b.h:.2f})"
+ROLE_PENS = {
+    pattern.COLUMN: (QColor(22, 26, 44), 0),
+    pattern.RULE_MINOR: (QColor(120, 96, 20), 1),
+    pattern.RULE_MAJOR: (QColor(255, 230, 80), 3),
+    pattern.DIAGONAL: (QColor(120, 255, 180), 3),
+    pattern.CIRCLE: (QColor(90, 130, 230), 5),
+    pattern.SEAM: (QColor(255, 93, 93), 2),
+}
+
+PATTERN_MODES: Tuple[Tuple[str, ...], ...] = (
+    ("rules",),
+    ("rules", "circles"),
+    ("columns", "rules", "diagonals", "circles"),
+)
+PATTERN_NAMES = ("line", "rules + circles", "full")
+
+MODE_PLACE = "place"
+MODE_CALIBRATE = "calibrate"
 
 
-def _fmt_pt(p: QPointF) -> str:
-    return f"({p.x():.2f},{p.y():.2f})"
-
-# Distinct, high-contrast colors cycled per display.
-_PALETTE = [
-    QColor("#ff5d5d"),
-    QColor("#4da3ff"),
-    QColor("#3ecf8e"),
-    QColor("#ffb74d"),
-    QColor("#b388ff"),
-    QColor("#4dd0e1"),
-]
-
-_GRIP = 16  # on-screen px for the corner resize handle (constant via ignored transform)
-
-
-def pil_to_pixmap(img: Image.Image) -> QPixmap:
-    """Convert a PIL image to a QPixmap using identical pixel data (no EXIF surprises)."""
+def pil_to_qimage(img: Image.Image) -> QImage:
+    """Convert a PIL image to a QImage over identical pixel data."""
     rgba = img.convert("RGBA")
     data = rgba.tobytes("raw", "RGBA")
     qimg = QImage(data, rgba.width, rgba.height, QImage.Format.Format_RGBA8888)
-    # copy() so the pixmap owns its memory (data buffer would otherwise be freed).
-    return QPixmap.fromImage(qimg.copy())
+    return qimg.copy()   # own the memory; the buffer above is about to be freed
 
 
-class _GripItem(QGraphicsRectItem):
-    """Bottom-right corner handle that drives an aspect-locked resize of its parent."""
+class WelcomeWindow(QWidget):
+    """The app's front door: a normal window, on one screen.
 
-    def __init__(self, parent: "DisplayRectItem", color: QColor):
-        super().__init__(-_GRIP / 2, -_GRIP / 2, _GRIP, _GRIP, parent)
-        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
-        self.setBrush(QBrush(color))
-        self.setPen(QPen(QColor("white"), 1.5))
-        self.setCursor(Qt.CursorShape.SizeFDiagCursor)
-        self.setZValue(3)
-        self._active = False
+    It exists for two reasons. Practically, a native file chooser parented to a frameless
+    fullscreen window does not reliably receive clicks on macOS — so browsing happens
+    here, before any fullscreen window is up. And conceptually, opening straight into a
+    calibration pattern across every monitor is a startling thing to do to someone who
+    just wanted to pick a picture.
+    """
 
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._active = True
-            parent = self.parentItem()
-            diaglog.log("grip.grab", name=repr(parent.display.name),
-                        scene_pt=_fmt_pt(event.scenePos()), box=_fmt_box(parent.current_box()))
-            event.accept()  # capture so the parent does not start a move
-        else:
-            event.ignore()
-
-    def mouseMoveEvent(self, event):
-        if self._active:
-            self.parentItem().resize_from_scene(event.scenePos())
-            event.accept()
-
-    def mouseReleaseEvent(self, event):
-        self._active = False
-        parent = self.parentItem()
-        box = parent.current_box()
-        diaglog.log("grip.resize_end", name=repr(parent.display.name),
-                    box=_fmt_box(box), as_crop=box.as_crop())
-        event.accept()
-
-
-class DisplayRectItem(QGraphicsItem):
-    """A movable, aspect-locked, image-clamped rectangle representing one display."""
-
-    def __init__(
-        self,
-        display: Display,
-        color: QColor,
-        img_w: float,
-        img_h: float,
-        on_change: Callable[[], None],
-    ):
+    def __init__(self, state: "AppState", app: "WallApp"):
         super().__init__()
-        self.display = display
-        self.color = color
-        self.img_w = img_w
-        self.img_h = img_h
-        self.aspect = display.aspect
-        self._on_change = on_change
-        self._w = 1.0
-        self._h = 1.0
-        self._locked = False
-        self._frozen = False        # calibration mode: no move/resize at all
-        self._programmatic = False  # bypass the move-clamp during set_box()
+        self.state = state
+        self.app = app
+        self.setWindowTitle("span")
+        self.setMinimumWidth(560)
 
-        self.setFlags(
-            QGraphicsItem.GraphicsItemFlag.ItemIsMovable
-            | QGraphicsItem.GraphicsItemFlag.ItemIsSelectable
-            | QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges
-        )
-        self.setCursor(Qt.CursorShape.SizeAllCursor)
-        self.setZValue(2)
+        title = QLabel("span")
+        title.setStyleSheet("font-size: 34px; font-weight: 600; color: #ECEFF8;")
+        subtitle = QLabel("One wallpaper across every display, measured in millimetres.")
+        subtitle.setStyleSheet("font-size: 14px; color: #8B90A6;")
 
-        self._label = QGraphicsSimpleTextItem(self)
-        self._label.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
-        self._label.setText(f"{display.name}\n{display.native_label}")
-        font = QFont()
-        font.setPointSize(11)
-        font.setBold(True)
-        self._label.setFont(font)
-        self._label.setBrush(QBrush(QColor("white")))
-        self._label.setPen(QPen(QColor(0, 0, 0, 200), 1.5))  # dark outline → readable anywhere
-        self._label.setZValue(3)
-        self._label.setPos(6, 6)
+        self._displays = QLabel()
+        self._displays.setStyleSheet(
+            "font-family: Menlo, monospace; font-size: 12px; color: #C3C7D6;")
+        self._status = QLabel()
+        self._status.setWordWrap(True)
+        self._status.setStyleSheet("font-size: 13.5px; color: #ECEFF8;")
 
-        self._grip = _GripItem(self, color)
-
-    # -- geometry -----------------------------------------------------------------
-    def boundingRect(self) -> QRectF:
-        pad = 2.0
-        return QRectF(-pad, -pad, self._w + 2 * pad, self._h + 2 * pad)
-
-    def paint(self, painter: QPainter, option, widget=None):
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        rect = QRectF(0, 0, self._w, self._h)
-        fill = QColor(self.color)
-        fill.setAlpha(60)
-        painter.fillRect(rect, fill)
-        pen = QPen(self.color, 3 if self.isSelected() else 2)
-        pen.setCosmetic(True)  # constant border width regardless of view zoom
-        painter.setPen(pen)
-        painter.drawRect(rect)
-
-    def set_box(self, box: Box):
-        self.prepareGeometryChange()
-        self._w = max(box.w, 1.0)
-        self._h = max(box.h, 1.0)
-        self._programmatic = True   # place exactly; caller has already fitted the group
-        self.setPos(box.x, box.y)
-        self._programmatic = False
-        self._reposition_children()
-        self.update()
-
-    def current_box(self) -> Box:
-        p = self.pos()
-        return Box(p.x(), p.y(), self._w, self._h)
-
-    def resize_from_scene(self, scene_pt: QPointF):
-        if self._locked:
-            return
-        p = self.pos()
-        w, h = aspect_resize(
-            p.x(), p.y(), scene_pt.x(), scene_pt.y(), self.aspect, self.img_w, self.img_h
-        )
-        self.prepareGeometryChange()
-        self._w, self._h = w, h
-        self._reposition_children()
-        self.update()
-        self._on_change()
-        self._resize_log_n = getattr(self, "_resize_log_n", 0) + 1
-        if self._resize_log_n % 6 == 0:
-            diaglog.log("item.resize", name=repr(self.display.name),
-                        corner=_fmt_pt(scene_pt), box=_fmt_box(self.current_box()))
-
-    def mousePressEvent(self, event):
-        diaglog.log("item.grab", name=repr(self.display.name),
-                    scene_pt=_fmt_pt(event.scenePos()), box=_fmt_box(self.current_box()))
-        super().mousePressEvent(event)
-
-    def mouseReleaseEvent(self, event):
-        super().mouseReleaseEvent(event)
-        box = self.current_box()
-        diaglog.log("item.move_end", name=repr(self.display.name),
-                    box=_fmt_box(box), as_crop=box.as_crop())
-
-    def set_locked(self, locked: bool):
-        """Lock to native size (1:1 mode): hide the grip and refuse resizes."""
-        self._locked = locked
-        self._grip.setVisible(not locked and not getattr(self, "_frozen", False))
-
-    def set_frozen(self, frozen: bool):
-        """Calibration mode: no move, no resize (the crop is the recommendation)."""
-        self._frozen = frozen
-        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, not frozen)
-        self._grip.setVisible(not frozen and not self._locked)
-
-    def _reposition_children(self):
-        self._grip.setPos(self._w, self._h)
-
-    def itemChange(self, change, value):
-        if change == QGraphicsItem.GraphicsItemChange.ItemPositionChange:
-            if self._programmatic:
-                return value  # exact placement (align/seed); no per-rect clamp
-            x, y = clamp_pos(value.x(), value.y(), self._w, self._h, self.img_w, self.img_h)
-            if abs(x - value.x()) > 0.01 or abs(y - value.y()) > 0.01:
-                # Throttle: a full-image-height rect clamps on every drag pixel.
-                self._clamp_log_n = getattr(self, "_clamp_log_n", 0) + 1
-                if self._clamp_log_n % 20 == 1:
-                    diaglog.log("item.clamp_move", name=repr(self.display.name),
-                                proposed=_fmt_pt(value), clamped=f"({x:.2f},{y:.2f})")
-            return QPointF(x, y)
-        if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
-            self._on_change()
-        return super().itemChange(change, value)
-
-
-class _ImageView(QGraphicsView):
-    """A view that keeps the whole scene fit-to-window on show and resize."""
-
-    def __init__(self, scene: QGraphicsScene):
-        super().__init__(scene)
-        self.setRenderHints(
-            QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform
-        )
-        self.setDragMode(QGraphicsView.DragMode.NoDrag)
-        self.setBackgroundBrush(QBrush(QColor("#202225")))
-        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-    def _fit(self):
-        scene = self.scene()
-        if scene is not None:
-            self.fitInView(scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
-            t = self.transform()
-            vp = self.viewport()
-            diaglog.log(
-                "view.fit",
-                viewport=f"{vp.width()}x{vp.height()}",
-                scale_x=round(t.m11(), 6),
-                scale_y=round(t.m22(), 6),
-                dpr=round(self.devicePixelRatioF(), 3),
-                scene=f"{scene.sceneRect().width():.0f}x{scene.sceneRect().height():.0f}",
-            )
-
-    def showEvent(self, event):
-        super().showEvent(event)
-        self._fit()
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self._fit()
-
-
-class SpanDialog(QDialog):
-    """The placement dialog. On Apply, ``result_boxes`` holds one crop Box per display."""
-
-    def __init__(self, pil_image: Image.Image, displays: List[Display],
-                 out_dir: Optional["Path"] = None, image_stem: str = "wallpaper"):
-        super().__init__()
-        self.setWindowTitle("span — place displays over the wallpaper")
-        self.resize(1100, 780)
-
-        self._displays = displays
-        self.result_boxes: Optional[Dict[int, Box]] = None
-        self._img_w = float(pil_image.width)
-        self._img_h = float(pil_image.height)
-        self._out_dir = out_dir
-        self._image_stem = image_stem
-        self._cell = DEFAULT_CELL
-
-        # Photo and calibration-grid backgrounds (same source-pixel space as the scene).
-        self._photo_pil = pil_image
-        self._grid_pil = make_grid(int(self._img_w), int(self._img_h), self._cell)
-        self._photo_pix = pil_to_pixmap(pil_image)
-        self._grid_pix = pil_to_pixmap(self._grid_pil)
-
-        self._scene = QGraphicsScene(self)
-        self._scene.setSceneRect(0, 0, self._img_w, self._img_h)
-        self._bg = self._scene.addPixmap(self._photo_pix)
-        self._bg.setZValue(0)
-        self._bg.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
-
-        self._view = _ImageView(self._scene)
-
-        # Create items first (no seeding yet) so the readout callback — which set_box()
-        # fires via itemChange — always sees a fully-populated item map.
-        self._items: Dict[int, DisplayRectItem] = {}
-        for i, d in enumerate(displays):
-            item = DisplayRectItem(
-                d, _PALETTE[i % len(_PALETTE)], self._img_w, self._img_h, self._update_readout
-            )
-            self._scene.addItem(item)
-            self._items[d.index] = item
-
-        self._readout = QLabel()
-        self._readout.setWordWrap(True)
-        mono = QFont("Menlo")
-        mono.setStyleHint(QFont.StyleHint.Monospace)
-        mono.setPointSize(11)
-        self._readout.setFont(mono)
-        self._readout.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-
-        hint = QLabel("Drag to move · drag the corner handle to resize (locked to the "
-                      "display's aspect) · rectangles stay inside the image.")
-        hint.setStyleSheet("color: #888;")
-
-        self._ppi_available = any(d.width_mm for d in displays)
-
-        reset_btn = self._reset_btn = QPushButton("Reset layout")
-        align_h_btn = self._align_h_btn = QPushButton("Align ⇆ H")
-        align_h_btn.setToolTip("Snap rectangles edge-to-edge horizontally at a consistent scale")
-        align_v_btn = self._align_v_btn = QPushButton("Align ⇅ V")
-        align_v_btn.setToolTip("Snap rectangles to the displays' true vertical offset")
-        self._native_cb = QCheckBox("1:1 native")
-        self._native_cb.setToolTip("Lock each rectangle to its display's exact native pixels "
-                                   "(no resampling — sharpest). Disables resize.")
-        self._ppi_cb = QCheckBox("Match size (PPI)")
-        self._ppi_cb.setChecked(self._ppi_available)
-        self._ppi_cb.setEnabled(self._ppi_available)
-        self._ppi_cb.setToolTip(
-            "On Align, size crops by each monitor's physical size so the image is the same "
-            "real-world scale across displays."
-            + ("" if self._ppi_available else "  (No physical-size data for these displays.)")
-        )
-
-        cancel_btn = QPushButton("Cancel")
-        apply_btn = QPushButton("Apply")
-        apply_btn.setDefault(True)
-
-        reset_btn.clicked.connect(self._reset)
-        align_h_btn.clicked.connect(lambda: self._align("h"))
-        align_v_btn.clicked.connect(lambda: self._align("v"))
-        self._native_cb.toggled.connect(self._toggle_native)
-        cancel_btn.clicked.connect(self.reject)
-        apply_btn.clicked.connect(self._apply)
+        self._browse = QPushButton("Browse image…")
+        self._browse.setDefault(True)
+        self._browse.clicked.connect(self.app.browse_and_continue)
+        self._calibrate = QPushButton("Calibrate wall")
+        self._calibrate.clicked.connect(lambda: self.app.open_wall(MODE_CALIBRATE))
+        self._place = QPushButton("Place image")
+        self._place.clicked.connect(lambda: self.app.open_wall(MODE_PLACE))
 
         buttons = QHBoxLayout()
-        buttons.addWidget(reset_btn)
-        buttons.addWidget(align_h_btn)
-        buttons.addWidget(align_v_btn)
-        buttons.addSpacing(16)
-        buttons.addWidget(self._native_cb)
-        buttons.addWidget(self._ppi_cb)
+        buttons.addWidget(self._browse)
+        buttons.addWidget(self._place)
         buttons.addStretch(1)
-        buttons.addWidget(cancel_btn)
-        buttons.addWidget(apply_btn)
-
-        # Calibration row: grid background, export, and seam-offset correction.
-        self._cal_cb = QCheckBox("Calibration grid")
-        self._cal_cb.setToolTip("Swap the background to a numbered grid; export it, set the "
-                                "crops as wallpapers, read the seam, then correct the offset.")
-        self._cal_cb.toggled.connect(self._toggle_calibration)
-        self._export_grid_btn = QPushButton("Export grid")
-        self._export_grid_btn.setEnabled(False)
-        self._export_grid_btn.clicked.connect(self._export_grid)
-
-        def _spin():
-            sb = QSpinBox()
-            sb.setRange(0, 9999)
-            sb.setFixedWidth(62)
-            return sb
-
-        self._row_l, self._row_r = _spin(), _spin()
-        self._col_l, self._col_r = _spin(), _spin()
-        self._suggest_btn = QPushButton("Suggest")
-        self._suggest_btn.setToolTip("Shift the right display so its grid numbers match the left")
-        self._suggest_btn.clicked.connect(self._suggest)
-
-        cal_row = QHBoxLayout()
-        cal_row.addWidget(self._cal_cb)
-        cal_row.addWidget(self._export_grid_btn)
-        cal_row.addSpacing(18)
-        cal_row.addWidget(QLabel("rows  L"))
-        cal_row.addWidget(self._row_l)
-        cal_row.addWidget(QLabel("= R"))
-        cal_row.addWidget(self._row_r)
-        cal_row.addSpacing(10)
-        cal_row.addWidget(QLabel("cols  L"))
-        cal_row.addWidget(self._col_l)
-        cal_row.addWidget(QLabel("= R"))
-        cal_row.addWidget(self._col_r)
-        cal_row.addWidget(self._suggest_btn)
-        cal_row.addStretch(1)
+        buttons.addWidget(self._calibrate)
 
         layout = QVBoxLayout(self)
-        layout.addWidget(self._view, 1)
-        layout.addWidget(hint)
-        layout.addWidget(self._readout)
-        layout.addLayout(cal_row)
+        layout.setContentsMargins(40, 34, 40, 30)
+        layout.setSpacing(12)
+        layout.addWidget(title)
+        layout.addWidget(subtitle)
+        layout.addSpacing(14)
+        layout.addWidget(self._displays)
+        layout.addSpacing(6)
+        layout.addWidget(self._status)
+        layout.addSpacing(14)
         layout.addLayout(buttons)
+        self.setStyleSheet(
+            "QWidget { background: #12131C; }"
+            "QPushButton { padding: 8px 20px; font-size: 13px; }"
+        )
+        self.refresh()
 
-        # Seed positions now that every item AND widget exists.
-        diaglog.log("dialog.init", image=f"{self._img_w:.0f}x{self._img_h:.0f}",
-                    scene=f"{self._scene.sceneRect().width():.0f}x{self._scene.sceneRect().height():.0f}",
-                    displays=len(displays))
-        seeds = seed_layout(self._displays, self._img_w, self._img_h,
-                            native_mode=self._native_cb.isChecked(), ppi_aware=self._ppi_aware())
-        for d in self._displays:
-            self._items[d.index].set_box(seeds[d.index])
-            b = seeds[d.index]
-            diaglog.log("dialog.seed", name=repr(d.name), box=_fmt_box(b),
-                        as_crop=b.as_crop(), native=f"{d.native_w}x{d.native_h}",
-                        aspect=round(d.aspect, 6))
-        self._update_readout()
+    def refresh(self) -> None:
+        st = self.state
+        rows = []
+        for p in st.panels:
+            rows.append(f"{p.name:<16} {p.px_w}×{p.px_h}   {p.ppi:5.1f} ppi   "
+                        f"{p.width_mm:6.1f} × {p.height_mm:5.1f} mm")
+        self._displays.setText("\n".join(rows))
 
-    # -- actions ------------------------------------------------------------------
-    def collect_boxes(self) -> Dict[int, Box]:
-        return {d.index: self._items[d.index].current_box() for d in self._displays}
+        calibrated = st.config.is_measured
+        has_image = st.image is not None
+        self._place.setEnabled(has_image and calibrated)
 
-    def _apply(self):
-        if self._cal_cb.isChecked():
-            # WYSIWYG: in calibration mode Apply exports the grid you see, and stays open.
-            self._export_grid()
-            return
-        self.result_boxes = self.collect_boxes()
-        diaglog.log("apply", "collecting final boxes")
-        for d in self._displays:
-            item = self._items[d.index]
-            box = item.current_box()
-            # The painted rect mapped into scene space — this is what the user SEES.
-            painted = item.mapRectToScene(QRectF(0, 0, item._w, item._h))
-            scene_bound = item.sceneBoundingRect()
-            diaglog.log(
-                "apply.geom",
-                name=repr(d.name),
-                pos_box=_fmt_box(box),
-                as_crop=box.as_crop(),
-                painted_scene=f"({painted.x():.2f},{painted.y():.2f} "
-                              f"{painted.width():.2f}x{painted.height():.2f})",
-                scene_bound=f"({scene_bound.x():.2f},{scene_bound.y():.2f} "
-                            f"{scene_bound.width():.2f}x{scene_bound.height():.2f})",
+        if not calibrated:
+            self._status.setText(
+                "This wall has not been calibrated yet.\n"
+                "Until it is, crops are laid out as though your panels were flush and "
+                "touching — which is exactly what makes a spanned image step at the seam. "
+                "Calibration is a one-off measurement per desk."
             )
+            self._calibrate.setText("Start calibration")
+            self._calibrate.setDefault(not has_image)
+        elif has_image:
+            self._status.setText(
+                f"Loaded {st.image_stem}  ({st.image.width}×{st.image.height})  ·  "
+                "wall calibrated. Place it across your displays."
+            )
+            self._calibrate.setText("Re-calibrate")
+        else:
+            self._status.setText("Wall calibrated. Choose an image to get started.")
+            self._calibrate.setText("Re-calibrate")
+
+
+class KeepDialog(QDialog):
+    """"Keep this wallpaper?" with a countdown that reverts if nothing is clicked.
+
+    The same shape as a display-resolution confirmation, and for the same reason: if the
+    result is unusable — or you walked away — doing nothing must undo it. So the timeout
+    reverts rather than keeps.
+    """
+
+    def __init__(self, parent: QWidget, seconds: int = KEEP_SECONDS):
+        super().__init__(parent)
+        self.setWindowTitle("Keep this wallpaper?")
+        self.setModal(True)
+        self._remaining = seconds
+        self.keep = False
+
+        title = QLabel("Keep this wallpaper?")
+        title.setStyleSheet("font-size: 19px; font-weight: 600; color: #ECEFF8;")
+        self._count = QLabel()
+        self._count.setStyleSheet("font-size: 13px; color: #7E849A;")
+
+        no = QPushButton("Revert")
+        yes = QPushButton("Keep")
+        yes.setDefault(True)
+        no.clicked.connect(self.reject)
+        yes.clicked.connect(self._accept_keep)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        buttons.addWidget(no)
+        buttons.addWidget(yes)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(28, 24, 28, 20)
+        layout.setSpacing(10)
+        layout.addWidget(title)
+        layout.addWidget(self._count)
+        layout.addSpacing(8)
+        layout.addLayout(buttons)
+        self.setStyleSheet("QDialog { background: #12131C; }"
+                           "QPushButton { padding: 6px 18px; }")
+
+        self._tick_timer = QTimer(self)
+        self._tick_timer.timeout.connect(self._tick)
+        self._tick_timer.start(1000)
+        self._render()
+
+    def _accept_keep(self):
+        self.keep = True
         self.accept()
 
-    def _reset(self):
-        # Back to the clean default seed — PPI/native-aware, always fit to the image.
-        seeds = seed_layout(self._displays, self._img_w, self._img_h,
-                            native_mode=self._native_cb.isChecked(), ppi_aware=self._ppi_aware())
-        self._apply_boxes(seeds)
-
-    def _apply_boxes(self, boxes: Dict[int, Box]):
-        # Keep the whole group inside the image as a unit (shift, or scale-to-fit if the
-        # arrangement is larger than the source). Preserves the seam.
-        boxes = fit_into_image(boxes, self._img_w, self._img_h)
-        for d in self._displays:
-            self._items[d.index].set_box(boxes[d.index])
-        for d in self._displays:
-            b = self._items[d.index].current_box()
-            diaglog.log("layout", name=repr(d.name), box=_fmt_box(b), as_crop=b.as_crop())
-        self._update_readout()
-
-    def _ppi_aware(self) -> bool:
-        return self._ppi_cb.isChecked() and self._ppi_available
-
-    def _align(self, axis: str):
-        native = self._native_cb.isChecked()
-        diaglog.log("align", axis=axis, native=native, ppi=self._ppi_aware())
-        boxes = align_boxes(
-            self._displays, self.collect_boxes(), axis,
-            native_mode=native, ppi_aware=self._ppi_aware(),
+    def _render(self):
+        self._count.setText(
+            f"Reverting to your previous wallpaper in {self._remaining}s "
+            "if you don't choose."
         )
-        self._apply_boxes(boxes)
 
-    def _toggle_native(self, checked: bool):
-        diaglog.log("toggle_native", on=checked)
-        for d in self._displays:
-            self._items[d.index].set_locked(checked)
-        self._ppi_cb.setEnabled(self._ppi_available and not checked)
-        if checked:
-            self._apply_boxes(to_native_boxes(self._displays, self.collect_boxes()))
+    def _tick(self):
+        self._remaining -= 1
+        if self._remaining <= 0:
+            self._tick_timer.stop()
+            self.reject()          # timeout == revert
+            return
+        self._render()
+
+
+@dataclass
+class AppState:
+    """Everything both windows read from. One object, so they cannot disagree."""
+
+    displays: List[Display]
+    config: WallConfig
+    image: Optional[Image.Image]
+    image_stem: str
+    out_dir: Path
+    image_path: Optional[Path] = None
+    mode: str = MODE_CALIBRATE
+    policy: str = "fit"
+    offset_mm: Tuple[float, float] = (0.0, 0.0)
+    pattern_mode: int = 0
+    message: str = ""
+
+    @property
+    def panels(self) -> List[Panel]:
+        return panels_from_displays(
+            self.displays,
+            gaps_mm=self.config.gaps_mm,
+            y_offsets_mm=self.config.y_offsets_mm,
+        )
+
+    @property
+    def seams(self) -> List[float]:
+        return seam_positions(self.panels, self.config.gaps_mm)
+
+    def plan(self) -> Optional[Plan]:
+        if self.image is None:
+            return None
+        panels = self.panels
+        S = choose_scale(self.image.width, self.image.height, panels, self.policy)
+        offset = clamp_offset(panels, self.image.width, self.image.height, S, self.offset_mm)
+        self.offset_mm = offset
+        return plan_layout(panels, self.image.width, self.image.height,
+                           scale=S, offset_mm=offset)
+
+
+class WallWindow(QWidget):
+    """Fullscreen view of the wall from one panel's point of view."""
+
+    def __init__(self, state: AppState, slot: int, dpr: float, app: "WallApp"):
+        super().__init__()
+        self.state = state
+        self.slot = slot
+        self.dpr = dpr
+        self.app = app
+        self._qimage: Optional[QImage] = None
+        self._drag_from: Optional[QPointF] = None
+        self._drag_offset: Tuple[float, float] = (0.0, 0.0)
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+
+    def set_image(self, qimage: Optional[QImage]) -> None:
+        self._qimage = qimage
+
+    @property
+    def panel(self) -> Panel:
+        return self.state.panels[self.slot]
+
+    def k(self) -> float:
+        """Logical pixels per millimetre on this panel."""
+        return self.panel.px_per_mm / self.dpr
+
+    def to_px(self, x_mm: float, y_mm: float) -> QPointF:
+        p = self.panel
+        k = self.k()
+        return QPointF((x_mm - p.x_mm) * k, (y_mm - p.y_mm) * k)
+
+    # -- painting ---------------------------------------------------------------------
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        p.fillRect(self.rect(), BG)
+
+        if self.state.mode == MODE_PLACE:
+            self._paint_image(p)
         else:
-            self._update_readout()
+            self._paint_pattern(p)
+        self._paint_hud(p)
 
-    def _toggle_calibration(self, on: bool):
-        diaglog.log("calibrate.mode", on=on)
-        self._bg.setPixmap(self._grid_pix if on else self._photo_pix)
-        self._export_grid_btn.setEnabled(on)
-        # In calibration mode the crops ARE the recommendation — no move/align/resize.
-        for d in self._displays:
-            self._items[d.index].set_frozen(on)
-        for w in (self._reset_btn, self._align_h_btn, self._align_v_btn, self._native_cb):
-            w.setEnabled(not on)
-
-    def _suggest(self):
-        dx, dy = calibration_shift(self._row_l.value(), self._row_r.value(),
-                                   self._col_l.value(), self._col_r.value(), self._cell)
-        diaglog.log("calibrate.suggest",
-                    rows=f"L{self._row_l.value()}=R{self._row_r.value()}",
-                    cols=f"L{self._col_l.value()}=R{self._col_r.value()}", dx=dx, dy=dy)
-        ds = sorted(self._displays, key=lambda d: d.x)
-        cur = self.collect_boxes()
-        for d in ds[1:]:  # nudge the right-hand display(s) to match the leftmost
-            b = cur[d.index]
-            cur[d.index] = Box(b.x + dx, b.y + dy, b.w, b.h)
-        self._apply_boxes(cur)
-        for sb in (self._row_l, self._row_r, self._col_l, self._col_r):
-            sb.setValue(0)
-
-    def _export_grid(self):
-        if self._out_dir is None:
+    def _paint_image(self, p: QPainter) -> None:
+        plan = self.state.plan()
+        if plan is None or self._qimage is None:
             return
-        self._out_dir.mkdir(parents=True, exist_ok=True)
-        boxes = self.collect_boxes()
-        paths = []
-        for d in self._displays:
-            b = boxes[d.index]
-            # Render the grid at the display's NATIVE resolution → crisp, high precision.
-            grid = make_crop_grid(b.x, b.y, b.w, b.h, d.native_w, d.native_h, self._cell)
-            fname = f"{self._image_stem}_GRID_{safe_name(d.name)}_{d.native_w}x{d.native_h}.png"
-            path = unique_path(self._out_dir / fname)
-            grid.save(path)
-            paths.append(path)
-        diaglog.log("calibrate.export", files=len(paths))
-        self._readout.setText(
-            "Calibration grids written (native-res):\n"
-            + "\n".join(f"  {p}" for p in paths)
-            + "\n→ set as wallpapers; at the seam read which left row meets which right row"
-            "\n  (numbers down the edges), type rows L = R, then Suggest. Aligned when L:n = R:n."
+        box = plan.boxes[self.panel.index]
+        # Source rect IS the export crop box — what you see is what gets written.
+        p.drawImage(
+            QRectF(0, 0, self.width(), self.height()),
+            self._qimage,
+            QRectF(box.x, box.y, box.w, box.h),
         )
 
-    def _update_readout(self):
-        # Defensive: set_box() can fire this via itemChange before init finishes wiring up.
-        if not getattr(self, "_readout", None) or not getattr(self, "_items", None):
+    def _paint_pattern(self, p: QPainter) -> None:
+        est = estate(self.state.panels)
+        pat = pattern.build(est, self.state.seams,
+                            modes=PATTERN_MODES[self.state.pattern_mode])
+        k = self.k()
+
+        for r in pat.rects:
+            colour, _ = ROLE_PENS[r.role]
+            a, b = self.to_px(r.x_mm, r.y_mm), self.to_px(r.x_mm + r.w_mm, r.y_mm + r.h_mm)
+            p.fillRect(QRectF(a, b), colour)
+        for ln in pat.lines:
+            colour, width = ROLE_PENS[ln.role]
+            p.setPen(QPen(colour, width))
+            p.drawLine(self.to_px(ln.x1_mm, ln.y1_mm), self.to_px(ln.x2_mm, ln.y2_mm))
+        for c in pat.circles:
+            colour, width = ROLE_PENS[c.role]
+            p.setPen(QPen(colour, width))
+            p.drawEllipse(self.to_px(c.cx_mm, c.cy_mm), c.r_mm * k, c.r_mm * k)
+
+        f = QFont()
+        f.setPointSizeF(10.0)
+        p.setFont(f)
+        p.setPen(QPen(HUD))
+        for lb in pat.labels:
+            p.drawText(self.to_px(lb.x_mm, lb.y_mm), lb.text)
+
+    def _paint_hud(self, p: QPainter) -> None:
+        st = self.state
+        pan = self.panel
+        focused = self.app.focus_slot == self.slot
+
+        f = QFont()
+        f.setPointSizeF(16.0)
+        f.setBold(True)
+        p.setFont(f)
+        p.setPen(QPen(HUD_KEY if focused else HUD))
+        head = f"{pan.name}   {pan.px_w}x{pan.px_h}   {pan.ppi:.1f} ppi"
+        if focused:
+            head += "   ← controlling"
+        p.drawText(QPointF(34, 52), head)
+
+        f.setBold(False)
+        f.setPointSizeF(12.5)
+        p.setFont(f)
+        p.setPen(QPen(HUD))
+
+        gap = st.config.gaps_mm[0] if st.config.gaps_mm else 0.0
+        line2 = (f"[{st.mode}]   y_mm {pan.y_mm:+.2f}   gap {gap:.2f} mm")
+        if st.mode == MODE_PLACE and st.image is not None:
+            plan = st.plan()
+            if plan is not None:
+                line2 += (f"   ·   {st.policy}   S {plan.scale:.3f} px/mm"
+                          f"   offset ({st.offset_mm[0]:+.1f}, {st.offset_mm[1]:+.1f}) mm")
+        p.drawText(QPointF(34, 80), line2)
+
+        if st.mode == MODE_PLACE and st.image is not None:
+            plan = st.plan()
+            if plan is not None and plan.upscaled:
+                p.setPen(QPen(WARN))
+                p.drawText(QPointF(34, 106),
+                           f"⚠ upscaled: {', '.join(plan.upscaled)} — try 'f' or a larger image")
+
+        if st.message:
+            p.setPen(QPen(HUD_KEY))
+            p.drawText(QPointF(34, 134), st.message)
+
+        p.setPen(QPen(HUD_DIM))
+        f.setPointSizeF(11.5)
+        p.setFont(f)
+        if st.mode == MODE_CALIBRATE:
+            keys = ("tab place  ·  click a screen to control it  ·  ↑↓ this panel 1 mm  ·  "
+                    "←→ bezel gap  ·  shift finer  ·  g pattern  ·  o open image  ·  "
+                    "⏎ save  ·  esc quit")
+        else:
+            keys = ("drag or ↑↓←→ move  ·  shift finer  ·  f fit / n native  ·  0 recentre"
+                    "  ·  o open  ·  W SET WALLPAPER  ·  ⏎ export files only  ·  "
+                    "tab calibrate  ·  esc back")
+        p.drawText(QPointF(34, self.height() - 34), keys)
+
+    # -- interaction ------------------------------------------------------------------
+    def mousePressEvent(self, event):
+        self.app.set_focus(self.slot)
+        if self.state.mode == MODE_PLACE:
+            self._drag_from = event.position()
+            self._drag_offset = self.state.offset_mm
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        self.app.repaint_all()
+
+    def mouseMoveEvent(self, event):
+        if self._drag_from is None or self.state.mode != MODE_PLACE:
             return
-        lines = []
-        for d in self._displays:
-            left, top, right, bottom = self._items[d.index].current_box().as_crop()
-            cw, ch = right - left, bottom - top
-            if cw == d.native_w and ch == d.native_h:
-                tag = "  · 1:1 (no resample)"
-            elif cw < d.native_w or ch < d.native_h:
-                tag = "  ⚠ upscaled"
+        # Drag in this panel's logical px -> wall mm. Moving the mouse right slides the
+        # image right, which is an increase in the image's wall origin.
+        k = self.k()
+        d = event.position() - self._drag_from
+        self.state.offset_mm = (self._drag_offset[0] + d.x() / k,
+                                self._drag_offset[1] + d.y() / k)
+        self.app.repaint_all()
+
+    def mouseReleaseEvent(self, event):
+        self._drag_from = None
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+
+    def keyPressEvent(self, event):
+        self.app.set_focus(self.slot)
+        self.app.handle_key(event, self.slot)
+
+
+class WallApp:
+    """Owns the windows and every key binding."""
+
+    def __init__(self, state: AppState):
+        self.state = state
+        self.windows: List[WallWindow] = []
+        self.focus_slot = 0
+        self.exported: List[Path] = []
+        self.welcome: Optional["WelcomeWindow"] = None
+        self._qimage: Optional[QImage] = None
+
+    def set_focus(self, slot: int) -> None:
+        self.focus_slot = slot
+
+    def repaint_all(self) -> None:
+        for w in self.windows:
+            w.update()
+        if self.welcome is not None:
+            self.welcome.refresh()
+
+    # -- the wall ---------------------------------------------------------------------
+    def open_wall(self, mode: str) -> None:
+        """Put the wall up on every display. The welcome window waits behind it."""
+        st = self.state
+        if mode == MODE_PLACE and st.image is None:
+            st.message = "no image loaded"
+            self.repaint_all()
+            return
+        st.mode = mode
+        st.message = ""
+        if self.windows:
+            for w in self.windows:
+                w.show()
+                w.raise_()
+            self.repaint_all()
+            return
+
+        screens = sorted(QGuiApplication.screens(), key=lambda s: s.geometry().x())
+        for i, _ in enumerate(st.panels):
+            screen = screens[i] if i < len(screens) else QGuiApplication.primaryScreen()
+            w = WallWindow(st, i, screen.devicePixelRatio(), self)
+            w.set_image(self._qimage)
+            w.setGeometry(screen.geometry())
+            w.show()
+            w.raise_()
+            self.windows.append(w)
+        if self.welcome is not None:
+            self.welcome.hide()
+        self.windows[0].activateWindow()
+        self.windows[0].setFocus()
+        diaglog.log("gui.wall_open", mode=mode, displays=len(self.windows))
+
+    def close_wall(self) -> None:
+        """Take the wall down and come back to the welcome window."""
+        for w in self.windows:
+            w.close()
+        self.windows = []
+        if self.welcome is not None:
+            self.welcome.refresh()
+            self.welcome.show()
+            self.welcome.raise_()
+            self.welcome.activateWindow()
+        diaglog.log("gui.wall_closed")
+
+    def browse_and_continue(self) -> None:
+        """Pick an image, then go wherever that leaves us: calibrate, or place."""
+        if not self.open_image():
+            return
+        if self.state.config.is_measured:
+            self.open_wall(MODE_PLACE)
+        elif self.welcome is not None:
+            # Not calibrated: stay on the welcome screen, which now explains why and
+            # offers the calibration button. No surprise fullscreen takeover.
+            self.welcome.refresh()
+            self.welcome.raise_()
+
+    # -- keys -------------------------------------------------------------------------
+    def handle_key(self, event, slot: int) -> None:
+        st = self.state
+        key = event.key()
+        fine = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+
+        if key == Qt.Key.Key_Escape:
+            self.close_wall()          # back to the welcome window, not straight out
+            return
+        if key == Qt.Key.Key_O:
+            self.open_image()
+            return
+        if key == Qt.Key.Key_Tab:
+            st.mode = MODE_PLACE if st.mode == MODE_CALIBRATE else MODE_CALIBRATE
+            if st.mode == MODE_PLACE and st.image is None:
+                st.mode = MODE_CALIBRATE
+                st.message = "no image loaded — press o to choose one"
             else:
-                tag = ""
-            ppi = f"  {d.ppi:.0f}ppi" if d.ppi else ""
-            lines.append(
-                f"{d.name:<18} crop {cw:>5}×{ch:<5} @ ({left:>5},{top:>5})  →  "
-                f"{d.native_label}{ppi}{tag}"
+                st.message = ""
+            self.repaint_all()
+            return
+        if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self._commit()
+            return
+
+        if st.mode == MODE_CALIBRATE:
+            self._calibrate_key(key, fine, slot)
+        else:
+            self._place_key(key, fine)
+        self.repaint_all()
+
+    def _calibrate_key(self, key, fine: bool, slot: int) -> None:
+        st = self.state
+        step = 0.2 if fine else 1.0
+        if key == Qt.Key.Key_G:
+            st.pattern_mode = (st.pattern_mode + 1) % len(PATTERN_MODES)
+            st.message = f"pattern: {PATTERN_NAMES[st.pattern_mode]}"
+            return
+        offsets = list(st.config.y_offsets_mm)
+        gaps = list(st.config.gaps_mm)
+        if key == Qt.Key.Key_Up:
+            offsets[slot] -= step
+        elif key == Qt.Key.Key_Down:
+            offsets[slot] += step
+        elif key == Qt.Key.Key_Left and gaps:
+            gaps[0] = max(0.0, gaps[0] - step)
+        elif key == Qt.Key.Key_Right and gaps:
+            gaps[0] += step
+        else:
+            return
+        st.config.y_offsets_mm = normalize(offsets)
+        st.config.gaps_mm = gaps
+        st.message = ""
+
+    def _place_key(self, key, fine: bool) -> None:
+        st = self.state
+        step = 1.0 if fine else 5.0
+        dx, dy = st.offset_mm
+        if key == Qt.Key.Key_Left:
+            dx -= step
+        elif key == Qt.Key.Key_Right:
+            dx += step
+        elif key == Qt.Key.Key_Up:
+            dy -= step
+        elif key == Qt.Key.Key_Down:
+            dy += step
+        elif key == Qt.Key.Key_F:
+            st.policy = "fit"
+            st.message = "scale: fit — cover the estate"
+            return
+        elif key == Qt.Key.Key_N:
+            st.policy = "native"
+            st.message = "scale: native — densest panel 1:1"
+            return
+        elif key == Qt.Key.Key_0:
+            st.offset_mm = (0.0, 0.0)
+            st.message = "recentred"
+            return
+        elif key == Qt.Key.Key_W:
+            self.apply_wallpaper()
+            return
+        else:
+            return
+        st.offset_mm = (dx, dy)
+        st.message = ""
+
+    # -- actions ----------------------------------------------------------------------
+    def _picker_start_dir(self, start_dir: Optional[Path]) -> str:
+        """Where the chooser opens: explicit, then last used, then the current image's
+        folder, then home.
+
+        Home rather than ~/Pictures — wallpapers are as likely to be in Downloads or on
+        the Desktop, and the sidebar reaches all of them from there.
+        """
+        for candidate in (start_dir, paths.last_image_dir(), self._current_image_dir()):
+            if candidate and Path(candidate).is_dir():
+                return str(candidate)
+        return str(Path.home())
+
+    def _current_image_dir(self) -> Optional[Path]:
+        p = self.state.image_path
+        return p.parent if p and p.parent.is_dir() else None
+
+    def open_image(self, start_dir: Optional[Path] = None) -> bool:
+        """Pick an image and swap it in live. Returns False if the user cancelled.
+
+        The wall is hidden for the duration: a native file chooser sitting over frameless
+        fullscreen windows does not reliably receive clicks on macOS.
+        """
+        st = self.state
+        wall_was_up = bool(self.windows) and self.windows[0].isVisible()
+        if wall_was_up:
+            for w in self.windows:
+                w.hide()
+        parent = self.welcome if self.welcome is not None else None
+        try:
+            path, _ = QFileDialog.getOpenFileName(
+                parent, "Choose a wallpaper", self._picker_start_dir(start_dir),
+                IMAGE_FILTER,
             )
-        self._readout.setText("\n".join(lines))
+        finally:
+            if wall_was_up:
+                for w in self.windows:
+                    w.show()
+                    w.raise_()
+        if not path:
+            return False
+        try:
+            image = load_image(Path(path))
+        except ImageLoadError as exc:
+            st.message = str(exc)
+            self.repaint_all()
+            return False
+
+        st.image = image
+        st.image_stem = Path(path).stem
+        st.image_path = Path(path)
+        st.offset_mm = (0.0, 0.0)     # a new image has no meaningful old framing
+        paths.remember_image_dir(Path(path))
+        self._qimage = pil_to_qimage(image)
+        for w in self.windows:
+            w.set_image(self._qimage)
+        st.message = f"loaded {Path(path).name}  ({image.width}×{image.height})"
+        diaglog.log("gui.image_opened", path=path, size=f"{image.width}x{image.height}")
+        self.repaint_all()
+        return True
+
+    def _export(self, out_dir: Path) -> List:
+        """Cut and write one PNG per panel. Returns the ExportResults."""
+        st = self.state
+        plan = st.plan()
+        if plan is None:
+            return []
+        out_dir.mkdir(parents=True, exist_ok=True)
+        results = export_all(st.image, st.panels, plan.boxes, out_dir, st.image_stem)
+        self.exported = [r.path for r in results]
+        diaglog.log("gui.exported", count=len(results), out_dir=str(out_dir))
+        return results
+
+    def apply_wallpaper(self) -> None:
+        """Export, set each display, then ask whether to keep it.
+
+        Files go to ``~/.span/tmp`` rather than the output directory: macOS keeps only a
+        *reference* to a wallpaper file, so it has to stay put, and the output directory is
+        the user's to delete.
+
+        Setting requires a calibrated wall. Without one the crops are laid out as though
+        the panels were flush and touching, which is exactly the stepped result this tool
+        exists to avoid — so it refuses and says what to do instead.
+        """
+        st = self.state
+        if st.image is None:
+            st.message = "nothing to set — press o to open an image"
+            self.repaint_all()
+            return
+        if not st.config.is_measured:
+            st.mode = MODE_CALIBRATE
+            st.message = ("calibrate first — this wall has no measured geometry, so the "
+                          "crops would step at the seam. Nudge until the pattern joins, "
+                          "press ⏎ to save, then tab back.")
+            diaglog.log("gui.wallpaper_blocked", reason="uncalibrated")
+            self.repaint_all()
+            return
+
+        # Record what is showing now, before anything changes, so Revert has a target.
+        before = capture()
+
+        results = self._export(paths.tmp_dir())
+        if not results:
+            st.message = "nothing to set"
+            self.repaint_all()
+            return
+        try:
+            outcome = set_wallpapers(
+                assignments_from_exports([(r.panel.name, r.path) for r in results])
+            )
+        except WallpaperError as exc:
+            st.message = f"could not set wallpaper: {exc}"
+            self.repaint_all()
+            return
+
+        failed = [o for o in outcome if not o.ok]
+        if len(failed) == len(outcome):
+            st.message = "could not set any display: " + ", ".join(
+                f"{o.display_name} ({o.error})" for o in failed)
+            self.repaint_all()
+            return
+
+        self._confirm_wallpaper(before, [r.path for r in results], failed)
+
+    def _confirm_wallpaper(self, before, new_paths, failed) -> None:
+        """Ask whether to keep it. Doing nothing reverts — that is what the timer is for."""
+        st = self.state
+        parent = self.windows[self.focus_slot] if self.windows else None
+        dialog = KeepDialog(parent)
+        dialog.exec()
+
+        if dialog.keep:
+            # Protect the files now serving as wallpaper: macOS only holds a reference, so
+            # pruning them would blank the desktop.
+            paths.prune_tmp(protect=new_paths)
+            self.exported = list(new_paths)
+            note = ""
+            if failed:
+                note = "  (failed: " + ", ".join(o.display_name for o in failed) + ")"
+            diaglog.log("gui.wallpaper_kept", count=len(new_paths))
+            st.message = f"wallpaper kept{note}"
+            self.repaint_all()
+            QApplication.quit()
+            return
+
+        restored = restore(before)
+        missing = [r for r in restored if not r.ok]
+        st.message = ("reverted to your previous wallpaper" if not missing else
+                      "reverted, except: " + ", ".join(
+                          f"{r.display_name} ({r.error})" for r in missing))
+        diaglog.log("gui.wallpaper_reverted", restored=len(restored) - len(missing),
+                    missing=len(missing))
+        paths.prune_tmp()
+        self.repaint_all()
+
+    def _commit(self) -> None:
+        st = self.state
+        if st.mode == MODE_CALIBRATE:
+            path = save_config(signature(st.displays), st.config)
+            st.message = f"saved wall calibration → {path}"
+            diaglog.log("gui.calibration_saved", y=st.config.y_offsets_mm,
+                        gaps=st.config.gaps_mm)
+        else:
+            results = self._export(st.out_dir)
+            # Exporting files is rarely the actual goal — say what the next step is
+            # rather than leaving someone looking at a wall with nothing to do.
+            st.message = (
+                f"exported {len(results)} file(s) → {st.out_dir}     "
+                "press w to set them as your wallpaper now"
+                if results else "nothing to export — press o to open an image"
+            )
+        self.repaint_all()
 
 
-def run_dialog(pil_image: Image.Image, displays: List[Display],
-               out_dir=None, image_stem: str = "wallpaper") -> Optional[Dict[int, Box]]:
-    """Open the placement dialog modally. Returns crop boxes, or None if cancelled."""
+def run(
+    displays: List[Display],
+    config: WallConfig,
+    image: Optional[Image.Image],
+    out_dir: Path,
+    image_stem: str = "wallpaper",
+    start_mode: Optional[str] = None,
+    image_path: Optional[Path] = None,
+) -> List[Path]:
+    """Start the app on its welcome window. Returns the paths exported, if any.
+
+    The wall only goes fullscreen when there is something to do with it — placing an
+    image, or calibrating. Everything before that happens in an ordinary window, which is
+    both less startling and the only way a native file chooser behaves properly.
+    """
     app = QApplication.instance() or QApplication([])
-    dialog = SpanDialog(pil_image, displays, out_dir=out_dir, image_stem=image_stem)
-    dialog.show()
-    dialog.raise_()
-    dialog.activateWindow()
-    if dialog.exec() == QDialog.DialogCode.Accepted:
-        return dialog.result_boxes
-    return None
+
+    state = AppState(
+        displays=displays, config=config.sized_for(len(displays)),
+        image=image, image_stem=image_stem, out_dir=out_dir, image_path=image_path,
+        mode=start_mode or (MODE_PLACE if image is not None else MODE_CALIBRATE),
+    )
+    if image_path is not None:
+        paths.remember_image_dir(image_path)
+
+    wall_app = WallApp(state)
+    wall_app._qimage = pil_to_qimage(image) if image is not None else None
+    welcome = WelcomeWindow(state, wall_app)
+    wall_app.welcome = welcome
+    welcome.show()
+    welcome.raise_()
+    welcome.activateWindow()
+
+    diaglog.log("gui.open", displays=len(displays), calibrated=config.is_measured,
+                has_image=image is not None)
+
+    def _start():
+        """Skip the welcome screen only when the command line already said what to do.
+
+        With no image given there is nothing to skip to — the welcome window waits for a
+        click rather than throwing a file dialog over itself before it has even painted.
+        """
+        if start_mode == MODE_CALIBRATE:
+            wall_app.open_wall(MODE_CALIBRATE)
+        elif image is not None and config.is_measured:
+            wall_app.open_wall(MODE_PLACE)
+
+    QTimer.singleShot(0, _start)
+    app.exec()
+    return wall_app.exported

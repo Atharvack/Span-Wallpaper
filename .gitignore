@@ -15,3 +15,8 @@ __pycache__/
 
 # Diagnostic logs
 *.log
+
+# runtime (span writes these beside the code in a checkout)
+/tmp/
+/logs/
+
