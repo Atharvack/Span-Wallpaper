@@ -235,3 +235,21 @@ def test_restoring_nothing_is_a_no_op(monkeypatch, span_home):
     monkeypatch.setattr(wp.subprocess, "run",
                         lambda *a, **k: pytest.fail("should not shell out"))
     assert wp.restore({}) == []
+
+
+# --- clearing the view ------------------------------------------------------------
+
+def test_hide_and_unhide_degrade_quietly_without_appkit():
+    """Outside a Qt app NSApplication is not registered; that must not raise."""
+    assert wp.hide_other_applications() in (True, False)
+    assert wp.unhide_all_applications() in (True, False)
+
+
+def test_objc_bridge_returns_none_when_the_class_is_missing(monkeypatch):
+    monkeypatch.setattr(wp.ctypes.util, "find_library", lambda name: None)
+    assert wp._objc() is None
+
+
+def test_send_is_a_no_op_without_a_bridge(monkeypatch):
+    monkeypatch.setattr(wp, "_objc", lambda: None)
+    assert wp._send(b"hideOtherApplications:") is False

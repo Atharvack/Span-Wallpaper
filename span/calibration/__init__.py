@@ -20,10 +20,12 @@ from .wallpaper import (
     assignments_from_exports,
     capture,
     current_wallpapers,
+    hide_other_applications,
     load_snapshot,
     restore,
     set_wallpapers,
     snapshot_path,
+    unhide_all_applications,
 )
 
 __all__ = [
@@ -41,8 +43,10 @@ __all__ = [
     "assignments_from_exports",
     "capture",
     "current_wallpapers",
+    "hide_other_applications",
     "load_snapshot",
     "restore",
     "set_wallpapers",
     "snapshot_path",
+    "unhide_all_applications",
 ]

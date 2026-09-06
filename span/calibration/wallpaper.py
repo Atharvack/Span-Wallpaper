@@ -27,11 +27,13 @@ stays correct however the displays are ordered.
 
 from __future__ import annotations
 
+import ctypes
+import ctypes.util
 import json
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from .. import diaglog, paths
 
@@ -204,6 +206,72 @@ def assignments_from_exports(exports: Sequence[Tuple[str, Path]]) -> List[Assign
 # already exist on disk, so copying megabytes for a one-minute undo window would be waste.
 # What the snapshot cannot survive is the original file being deleted in the meantime,
 # which :func:`restore` reports rather than silently skipping.
+
+# --------------------------------------------------------------------------------------
+# Clearing the view
+# --------------------------------------------------------------------------------------
+#
+# A wallpaper you cannot see is a wallpaper you cannot judge. Before asking "keep this?"
+# the desktop has to actually be visible, which means hiding every other application's
+# windows as well as our own.
+#
+# ``[NSApp hideOtherApplications:]`` is the same action as ⌥⌘H — a standard AppKit call
+# from the running application, so it needs no Accessibility permission. Driving it
+# through System Events instead would prompt for one. Reached via objc_msgSend because Qt
+# has already created the NSApplication and we only need two selectors, which is not worth
+# a PyObjC dependency.
+
+def _objc():
+    """(objc lib, NSApp) or None if the bridge is unavailable."""
+    try:
+        lib = ctypes.util.find_library("objc")
+        if not lib:
+            return None
+        objc = ctypes.cdll.LoadLibrary(lib)
+        objc.objc_getClass.restype = ctypes.c_void_p
+        objc.objc_getClass.argtypes = [ctypes.c_char_p]
+        objc.sel_registerName.restype = ctypes.c_void_p
+        objc.sel_registerName.argtypes = [ctypes.c_char_p]
+        objc.objc_msgSend.restype = ctypes.c_void_p
+        objc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+
+        cls = objc.objc_getClass(b"NSApplication")
+        if not cls:
+            return None
+        app = objc.objc_msgSend(ctypes.c_void_p(cls),
+                                ctypes.c_void_p(objc.sel_registerName(b"sharedApplication")),
+                                None)
+        return (objc, app) if app else None
+    except Exception:  # pragma: no cover - platform dependent
+        return None
+
+
+def _send(selector: bytes) -> bool:
+    bridge = _objc()
+    if bridge is None:
+        return False
+    objc, app = bridge
+    try:
+        objc.objc_msgSend(ctypes.c_void_p(app),
+                          ctypes.c_void_p(objc.sel_registerName(selector)), None)
+        return True
+    except Exception:  # pragma: no cover - platform dependent
+        return False
+
+
+def hide_other_applications() -> bool:
+    """Hide every other app's windows so the desktop shows. Same as ⌥⌘H."""
+    ok = _send(b"hideOtherApplications:")
+    diaglog.log("wallpaper.hide_others", ok=ok)
+    return ok
+
+
+def unhide_all_applications() -> bool:
+    """Put back everything :func:`hide_other_applications` hid."""
+    ok = _send(b"unhideAllApplications:")
+    diaglog.log("wallpaper.unhide_all", ok=ok)
+    return ok
+
 
 def snapshot_path() -> Path:
     return paths.tmp_dir() / SNAPSHOT_NAME

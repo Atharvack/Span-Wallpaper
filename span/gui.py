@@ -62,10 +62,12 @@ from .calibration import (
     WallpaperError,
     assignments_from_exports,
     capture,
+    hide_other_applications,
     normalize,
     pattern,
     restore,
     set_wallpapers,
+    unhide_all_applications,
 )
 from .calibration import save as save_config
 
@@ -828,11 +830,40 @@ class WallApp:
 
         self._confirm_wallpaper(before, [r.path for r in results], failed)
 
+    def _clear_the_view(self) -> None:
+        """Get everything out of the way so the wallpaper is actually visible.
+
+        Our own fullscreen wall first — it is a full-screen copy of the very thing being
+        judged, and leaving it up would mean approving a preview rather than the result.
+        Then every other application's windows.
+        """
+        for w in self.windows:
+            w.hide()
+        if self.welcome is not None:
+            self.welcome.hide()
+        hide_other_applications()
+        QApplication.processEvents()     # let the hiding actually paint before we ask
+
+    def _restore_the_view(self, show_wall: bool) -> None:
+        unhide_all_applications()
+        if show_wall:
+            for w in self.windows:
+                w.show()
+                w.raise_()
+            if self.windows:
+                self.windows[self.focus_slot].activateWindow()
+        elif self.welcome is not None:
+            self.welcome.show()
+            self.welcome.raise_()
+
     def _confirm_wallpaper(self, before, new_paths, failed) -> None:
         """Ask whether to keep it. Doing nothing reverts — that is what the timer is for."""
         st = self.state
-        parent = self.windows[self.focus_slot] if self.windows else None
-        dialog = KeepDialog(parent)
+        self._clear_the_view()
+        # No parent: the dialog has to outlive the windows we just hid, and float over a
+        # bare desktop as the only thing on screen.
+        dialog = KeepDialog(None)
+        dialog.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
         dialog.exec()
 
         if dialog.keep:
@@ -846,7 +877,9 @@ class WallApp:
                 note = "  (failed: " + ", ".join(o.display_name for o in failed) + ")"
             diaglog.log("gui.wallpaper_kept", count=len(new_paths))
             st.message = f"wallpaper kept{note}"
-            self.repaint_all()
+            # Put everyone else's windows back before leaving — we hid them, so we own
+            # undoing it, and quitting mid-hide would strand the desktop.
+            unhide_all_applications()
             QApplication.quit()
             return
 
@@ -862,6 +895,7 @@ class WallApp:
         if not missing:
             paths.prune_wallpapers(keep=[])
         paths.prune_tmp()
+        self._restore_the_view(show_wall=True)
         self.repaint_all()
 
     def _commit(self) -> None:

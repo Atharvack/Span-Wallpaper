@@ -366,3 +366,42 @@ def test_set_wallpaper_button_goes_through_the_calibration_gate(qapp, tmp_path,
     win._set_btn.click()
     assert state.mode == MODE_CALIBRATE
     assert "calibrate first" in state.message
+
+
+def test_confirming_a_wallpaper_hides_our_own_windows_first(qapp, tmp_path, monkeypatch):
+    """Approving a preview is not approving the result — the wall has to come down."""
+    from span.gui import MODE_PLACE, WallApp, WallWindow
+
+    calls = []
+    monkeypatch.setattr("span.gui.hide_other_applications",
+                        lambda: calls.append("hide_others") or True)
+    monkeypatch.setattr("span.gui.unhide_all_applications",
+                        lambda: calls.append("unhide") or True)
+    monkeypatch.setattr("span.gui.restore", lambda before: [])
+
+    class _Dismissed:
+        keep = False
+
+        def __init__(self, *a, **k):
+            pass
+
+        def setWindowFlag(self, *a, **k):
+            pass
+
+        def exec(self):
+            calls.append("dialog")
+            return 0
+
+    monkeypatch.setattr("span.gui.KeepDialog", _Dismissed)
+
+    state = _state(tmp_path)
+    state.mode = MODE_PLACE
+    app = WallApp(state)
+    app.windows = [WallWindow(state, 0, 1.0, app)]
+    app.windows[0].show()
+
+    app._confirm_wallpaper({}, [], [])
+
+    # Others hidden before the question, restored after it.
+    assert calls.index("hide_others") < calls.index("dialog") < calls.index("unhide")
+    assert app.windows[0].isVisible()      # reverted, so the wall comes back
