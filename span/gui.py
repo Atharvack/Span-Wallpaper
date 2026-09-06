@@ -734,7 +734,7 @@ class WallApp:
         # Record what is showing now, before anything changes, so Revert has a target.
         before = capture()
 
-        results = self._export(paths.tmp_dir())
+        results = self._export(paths.wallpaper_dir())
         if not results:
             st.message = "nothing to set"
             self.repaint_all()
@@ -765,9 +765,10 @@ class WallApp:
         dialog.exec()
 
         if dialog.keep:
-            # Protect the files now serving as wallpaper: macOS only holds a reference, so
-            # pruning them would blank the desktop.
-            paths.prune_tmp(protect=new_paths)
+            # Leave only what is actually on screen: the previous set is referenced by
+            # nothing now, and macOS only holds a reference to the current one.
+            paths.prune_wallpapers(keep=new_paths)
+            paths.prune_tmp()
             self.exported = list(new_paths)
             note = ""
             if failed:
@@ -785,6 +786,10 @@ class WallApp:
                           f"{r.display_name} ({r.error})" for r in missing))
         diaglog.log("gui.wallpaper_reverted", restored=len(restored) - len(missing),
                     missing=len(missing))
+        # Reverted, so the images we just wrote are referenced by nothing — but only clear
+        # them if the restore actually took, or we would delete what is still on screen.
+        if not missing:
+            paths.prune_wallpapers(keep=[])
         paths.prune_tmp()
         self.repaint_all()
 

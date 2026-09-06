@@ -134,10 +134,10 @@ Three other details it handles:
 
 * **Scaling is pinned.** The crops are already exactly native resolution; letting macOS
   pick a scaling mode could silently undo the millimetre work.
-* **The files go to `~/.span/tmp`**, not your output directory. macOS stores a *reference*
-  to a wallpaper file, so it has to keep existing — writing to the system temp directory
-  would make the desktop revert when the OS cleaned up. Files currently serving as a
-  wallpaper are exempt from pruning regardless of age.
+* **The files go to `tmp/desktop_wallpaper_do_not_remove/`**, not your output directory.
+  macOS stores a *reference* to a wallpaper file, so it has to keep existing — writing to
+  the system temp directory would make the desktop revert when the OS cleaned up. That
+  folder holds only the current set; the previous one is cleared once you press Keep.
 * **One failed display doesn't hide the others.** Each result is reported separately, and
   the undo snapshot only stores paths — so if you delete an original in the meantime, the
   revert says which one it could not restore rather than skipping it silently.
@@ -155,12 +155,21 @@ Working from a checkout, they sit beside the code:
 ```
 tmp/wall.json              measured wall geometry, per setup
 tmp/wallpaper-before.json  what was on screen before the last set
-tmp/*.png                  generated images — patterns, wallpaper copies
+tmp/*.png                  every generated image — exports, patterns
+tmp/desktop_wallpaper_do_not_remove/
+                           the images currently ON your desktop
 logs/span.log              one append-only log across every session
 ```
 
-`tmp` is span's whole working directory, state and images together. Pruning only ever
-removes *images*, so the JSON beside them is never at risk.
+`tmp` is span's whole working directory, state and images together. Every image span
+generates lands there — including `⏎` exports, which default to `tmp/` rather than the
+directory you happened to run the command in.
+
+`desktop_wallpaper_do_not_remove/` is named as a warning to a future human with a cleanup
+impulse: macOS stores a *reference* to a wallpaper file, not a copy, so deleting what is
+in there blanks the desktop. Nothing else is written to it, it holds only the current set,
+and pruning cannot reach it — `prune_tmp` does not recurse, so the folder is out of scope
+by construction rather than by an exclusion someone could forget.
 
 The log is a single file, never truncated, flushed per record — so you can point a
 terminal at it once and watch the tool work:

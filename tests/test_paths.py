@@ -53,7 +53,7 @@ def test_prune_keeps_the_newest_and_removes_the_rest(span_home):
     removed = paths.prune_tmp(keep=3)
 
     assert len(removed) == 7
-    remaining = sorted(p.name for p in paths.tmp_dir().iterdir())
+    remaining = sorted(p.name for p in paths.tmp_dir().iterdir() if p.is_file())
     assert remaining == ["f7.png", "f8.png", "f9.png"]
 
 
@@ -148,3 +148,46 @@ def test_last_image_dir_forgets_a_folder_that_has_gone(span_home, tmp_path):
     paths.remember_image_dir(gone)
     gone.rmdir()
     assert paths.last_image_dir() is None
+
+
+def test_wallpaper_folder_sits_inside_tmp(span_home):
+    assert paths.wallpaper_dir() == paths.tmp_dir() / "desktop_wallpaper_do_not_remove"
+
+
+def test_ensure_dirs_creates_the_wallpaper_folder(span_home):
+    paths.ensure_dirs()
+    assert paths.wallpaper_dir().is_dir()
+
+
+def test_pruning_tmp_never_reaches_into_the_wallpaper_folder(span_home):
+    """These files are what macOS references; deleting one blanks a display."""
+    paths.ensure_dirs()
+    live = paths.wallpaper_dir() / "on-screen.png"
+    live.write_bytes(b"x")
+    os.utime(live, (0, 0))                       # oldest thing on disk
+    for i in range(1, 6):
+        f = paths.tmp_dir() / f"img{i}.png"
+        f.write_bytes(b"x")
+        os.utime(f, (i, i))
+
+    paths.prune_tmp(keep=1)
+    assert live.exists()
+
+
+def test_prune_wallpapers_leaves_only_the_current_set(span_home):
+    paths.ensure_dirs()
+    keep = paths.wallpaper_dir() / "new.png"
+    old = paths.wallpaper_dir() / "previous.png"
+    keep.write_bytes(b"x")
+    old.write_bytes(b"x")
+
+    removed = paths.prune_wallpapers(keep=[keep])
+    assert removed == [old]
+    assert keep.exists() and not old.exists()
+
+
+def test_prune_wallpapers_with_nothing_to_keep_empties_it(span_home):
+    paths.ensure_dirs()
+    (paths.wallpaper_dir() / "orphan.png").write_bytes(b"x")
+    paths.prune_wallpapers(keep=[])
+    assert list(paths.wallpaper_dir().iterdir()) == []

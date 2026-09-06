@@ -30,9 +30,14 @@ class OutDirError(ValueError):
 def resolve_out_dir(arg_out: Optional[str]) -> Path:
     """Resolve (but do not create) the output directory.
 
-    Order: ``--out`` > ``$SPAN_ROOT`` > cwd. When ``SPAN_ROOT`` is set it is a confinement
-    boundary and the resolved directory must live inside it. Creation happens later, only
-    when files are actually written, so quitting without exporting leaves nothing behind.
+    Order: ``--out`` > ``$SPAN_ROOT`` > ``tmp/``. When ``SPAN_ROOT`` is set it is a
+    confinement boundary and the resolved directory must live inside it. Creation happens
+    later, only when files are actually written, so quitting without exporting leaves
+    nothing behind.
+
+    The default is ``tmp/`` rather than the working directory: exporting used to scatter
+    multi-megabyte PNGs wherever you happened to run the command, which is how six stale
+    files accumulated at the repo root. Generated images belong in one known place.
     """
     root = os.environ.get("SPAN_ROOT")
     if arg_out:
@@ -40,7 +45,7 @@ def resolve_out_dir(arg_out: Optional[str]) -> Path:
     elif root:
         out = Path(root).expanduser().resolve()
     else:
-        out = Path.cwd().resolve()
+        out = paths.tmp_dir().resolve()
 
     if root:
         root_p = Path(root).expanduser().resolve()
@@ -90,7 +95,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("image", nargs="?", help="source image path")
     parser.add_argument("--out", metavar="DIR",
-                        help="output directory (default: $SPAN_ROOT or current dir)")
+                        help="output directory (default: $SPAN_ROOT or span's tmp/)")
     parser.add_argument("--list", action="store_true",
                         help="print detected displays as JSON and exit")
     parser.add_argument("--raw", action="store_true",

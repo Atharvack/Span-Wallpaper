@@ -4,8 +4,15 @@ One base directory holding everything:
 
     tmp/wall.json              measured wall geometry, per setup
     tmp/wallpaper-before.json  what was on screen before the last set
-    tmp/*.png                  generated images — patterns, wallpaper copies
+    tmp/*.png                  every generated image — exports, patterns
+    tmp/desktop_wallpaper_do_not_remove/
+                               the images currently ON your desktop
     logs/span.log              one append-only log, every session, tailable
+
+The `desktop_wallpaper_do_not_remove` folder is named as a warning to a future human with
+a cleanup impulse. macOS stores a *reference* to a wallpaper file rather than a copy, so
+deleting what is in there blanks the desktop. Nothing else is written to it, it holds
+only the current set, and pruning never touches it.
 
 Which base depends on how span is running. From a source checkout it is the **project
 root**, so the files sit beside the code where you can see and tail them while working.
@@ -63,6 +70,15 @@ def tmp_dir() -> Path:
     return home() / "tmp"
 
 
+def wallpaper_dir() -> Path:
+    """Where the images currently set as wallpaper live, and nothing else.
+
+    Separate from ``tmp`` because these files are load-bearing: macOS references them, so
+    removing one blanks that display. The long name is the warning label.
+    """
+    return tmp_dir() / "desktop_wallpaper_do_not_remove"
+
+
 def log_dir() -> Path:
     return home() / "logs"
 
@@ -79,7 +95,7 @@ def config_file() -> Path:
 
 def ensure_dirs() -> None:
     """Create the base layout. Safe to call repeatedly; ignores a read-only home."""
-    for d in (home(), tmp_dir(), log_dir()):
+    for d in (home(), tmp_dir(), wallpaper_dir(), log_dir()):
         try:
             d.mkdir(parents=True, exist_ok=True)
         except OSError:
@@ -100,6 +116,8 @@ def prune_tmp(keep: int = TMP_KEEP, protect: Optional[Iterable[Path]] = None) ->
     if not d.is_dir():
         return []
     keep_paths = {Path(p).resolve() for p in (protect or ())}
+    # iterdir does not recurse, so desktop_wallpaper_do_not_remove/ is out of reach here
+    # by construction rather than by an exclusion that could be forgotten.
     images = sorted(
         (f for f in d.iterdir()
          if f.is_file() and f.suffix.lower() in IMAGE_SUFFIXES
@@ -108,6 +126,28 @@ def prune_tmp(keep: int = TMP_KEEP, protect: Optional[Iterable[Path]] = None) ->
     )
     removed: List[Path] = []
     for f in images[keep:]:
+        try:
+            f.unlink()
+            removed.append(f)
+        except OSError:
+            pass
+    return removed
+
+
+def prune_wallpapers(keep: Iterable[Path]) -> List[Path]:
+    """Leave only the given files in the wallpaper folder. Returns what was removed.
+
+    Called after a new set is confirmed, so the folder holds exactly what is on screen —
+    never the previous set, which nothing references any more.
+    """
+    d = wallpaper_dir()
+    if not d.is_dir():
+        return []
+    keep_paths = {Path(p).resolve() for p in keep}
+    removed: List[Path] = []
+    for f in d.iterdir():
+        if not f.is_file() or f.resolve() in keep_paths:
+            continue
         try:
             f.unlink()
             removed.append(f)
@@ -145,6 +185,7 @@ def describe() -> str:
     rows = [
         ("home", home()),
         ("tmp", tmp_dir()),
+        ("wallpaper", wallpaper_dir()),
         ("calibration", config_file()),
         ("log", log_file()),
     ]

@@ -151,3 +151,11 @@ def test_main_reports_a_missing_image(monkeypatch, capsys, tmp_path):
 def _display():
     from span.algorithm.displays import Display
     return Display(0, "X", 0, 0, 1920, 1080, 1.0, 1, 530.0869485606318, 298.0)
+
+
+def test_exports_default_to_tmp_not_the_working_directory(monkeypatch, tmp_path):
+    """Exporting used to scatter multi-megabyte PNGs wherever you ran the command."""
+    from span import paths
+    monkeypatch.delenv("SPAN_ROOT", raising=False)
+    monkeypatch.setenv("SPAN_HOME", str(tmp_path))
+    assert cli.resolve_out_dir(None) == paths.tmp_dir().resolve()
