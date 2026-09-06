@@ -102,6 +102,26 @@ PATTERN_NAMES = ("line", "rules + circles", "full")
 MODE_PLACE = "place"
 MODE_CALIBRATE = "calibrate"
 
+# Big enough to hit without aiming, on a wall you are looking at from across the desk.
+ACTION_BUTTON_CSS = """
+QPushButton {
+    background: rgba(18, 19, 28, 235);
+    color: #ECEFF8;
+    border: 2px solid rgba(140, 148, 176, 120);
+    border-radius: 12px;
+    padding: 20px 40px;
+    font-size: 21px;
+    font-weight: 600;
+}
+QPushButton:hover  { background: rgba(90, 130, 230, 235); border-color: #8FB0FF; }
+QPushButton:pressed{ background: rgba(60, 96, 190, 245); }
+QPushButton#primary {
+    background: rgba(90, 130, 230, 235);
+    border-color: #8FB0FF;
+}
+QPushButton#primary:hover { background: rgba(112, 152, 245, 245); }
+"""
+
 
 def pil_to_qimage(img: Image.Image) -> QImage:
     """Convert a PIL image to a QImage over identical pixel data."""
@@ -322,6 +342,53 @@ class WallWindow(QWidget):
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
         self.setCursor(Qt.CursorShape.OpenHandCursor)
 
+        # Real widgets rather than painted rectangles: they take the click themselves, so
+        # pressing one can never be mistaken for the start of an image drag.
+        self._set_btn = QPushButton("Set wallpaper", self)
+        self._set_btn.setObjectName("primary")
+        self._set_btn.clicked.connect(self.app.apply_wallpaper)
+        self._browse_btn = QPushButton("Browse images", self)
+        self._browse_btn.clicked.connect(self.app.open_image)
+        self._exit_btn = QPushButton("Exit", self)
+        self._exit_btn.clicked.connect(QApplication.quit)
+
+        self._buttons = (self._set_btn, self._browse_btn, self._exit_btn)
+        for b in self._buttons:
+            b.setStyleSheet(ACTION_BUTTON_CSS)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)   # keep arrow keys driving the image
+
+    def _layout_buttons(self) -> None:
+        """Centre the row along the bottom, and show it only where it applies.
+
+        Calibration is a keyboard job — nudging by millimetres — so the buttons would be
+        three large distractions sitting on top of the pattern you are trying to read.
+        """
+        place = self.state.mode == MODE_PLACE
+        for b in self._buttons:
+            b.setVisible(place)
+        if not place:
+            return
+
+        gap = 26
+        widths = [b.sizeHint().width() for b in self._buttons]
+        height = max(b.sizeHint().height() for b in self._buttons)
+        total = sum(widths) + gap * (len(self._buttons) - 1)
+        x = (self.width() - total) // 2
+        y = self.height() - height - 56
+        for b, w in zip(self._buttons, widths):
+            b.setGeometry(x, y, w, height)
+            b.raise_()
+            x += w + gap
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._layout_buttons()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._layout_buttons()
+
     def set_image(self, qimage: Optional[QImage]) -> None:
         self._qimage = qimage
 
@@ -435,12 +502,15 @@ class WallWindow(QWidget):
         if st.mode == MODE_CALIBRATE:
             keys = ("tab place  ·  click a screen to control it  ·  ↑↓ this panel 1 mm  ·  "
                     "←→ bezel gap  ·  shift finer  ·  g pattern  ·  o open image  ·  "
-                    "⏎ save  ·  esc quit")
+                    "⏎ save  ·  esc back")
+            y = self.height() - 34
         else:
+            # Shortcuts for the same three actions the buttons offer, plus the framing
+            # controls. Sits above the button row rather than under it.
             keys = ("drag or ↑↓←→ move  ·  shift finer  ·  f fit / n native  ·  0 recentre"
-                    "  ·  o open  ·  W SET WALLPAPER  ·  ⏎ export files only  ·  "
-                    "tab calibrate  ·  esc back")
-        p.drawText(QPointF(34, self.height() - 34), keys)
+                    "  ·  ⏎ export files only  ·  tab calibrate  ·  esc back")
+            y = self.height() - 160
+        p.drawText(QPointF(34, y), keys)
 
     # -- interaction ------------------------------------------------------------------
     def mousePressEvent(self, event):
@@ -487,6 +557,7 @@ class WallApp:
 
     def repaint_all(self) -> None:
         for w in self.windows:
+            w._layout_buttons()      # the row appears and vanishes with the mode
             w.update()
         if self.welcome is not None:
             self.welcome.refresh()

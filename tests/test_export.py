@@ -2,6 +2,7 @@
 
 import pytest
 from PIL import Image
+from PySide6.QtCore import Qt
 
 from span.algorithm.displays import Display
 from span.algorithm.wall import Box, panels_from_displays, plan_layout
@@ -305,3 +306,63 @@ def test_escape_returns_to_welcome_instead_of_quitting(qapp, tmp_path, monkeypat
     app.close_wall()
     assert app.windows == []
     assert app.welcome.isVisible()
+
+
+# --- action buttons on the placement view ----------------------------------------
+
+def _wall(tmp_path, mode):
+    from span.gui import WallApp, WallWindow
+    state = _state(tmp_path)
+    state.mode = mode
+    app = WallApp(state)
+    win = WallWindow(state, 0, 1.0, app)
+    win.resize(2560, 1440)
+    win._layout_buttons()
+    return state, app, win
+
+
+def test_three_action_buttons_are_shown_when_placing(qapp, tmp_path):
+    from span.gui import MODE_PLACE
+    _, _, win = _wall(tmp_path, MODE_PLACE)
+    labels = [b.text() for b in win._buttons]
+    assert labels == ["Set wallpaper", "Browse images", "Exit"]
+    assert all(not b.isHidden() for b in win._buttons)
+
+
+def test_buttons_are_hidden_while_calibrating(qapp, tmp_path):
+    """Calibration is a millimetre-nudging keyboard job; the row would just cover the
+    pattern being read."""
+    from span.gui import MODE_CALIBRATE
+    _, _, win = _wall(tmp_path, MODE_CALIBRATE)
+    assert all(b.isHidden() for b in win._buttons)
+
+
+def test_buttons_sit_along_the_bottom_and_inside_the_window(qapp, tmp_path):
+    from span.gui import MODE_PLACE
+    _, _, win = _wall(tmp_path, MODE_PLACE)
+    for b in win._buttons:
+        g = b.geometry()
+        assert g.left() >= 0 and g.right() <= win.width()
+        assert g.bottom() < win.height()
+        assert g.top() > win.height() // 2      # bottom half, out of the picture's way
+
+
+def test_buttons_do_not_steal_the_arrow_keys(qapp, tmp_path):
+    """Focus would send ↑↓←→ to the button row instead of moving the image."""
+    from span.gui import MODE_PLACE
+    _, _, win = _wall(tmp_path, MODE_PLACE)
+    assert all(b.focusPolicy() == Qt.FocusPolicy.NoFocus for b in win._buttons)
+
+
+def test_set_wallpaper_button_goes_through_the_calibration_gate(qapp, tmp_path,
+                                                                monkeypatch):
+    from span.calibration import WallConfig
+    from span.gui import MODE_CALIBRATE, MODE_PLACE
+
+    monkeypatch.setattr("span.gui.set_wallpapers",
+                        lambda *a, **k: pytest.fail("should not reach the OS"))
+    state, app, win = _wall(tmp_path, MODE_PLACE)
+    state.config = WallConfig(y_offsets_mm=[0.0, 0.0], gaps_mm=[0.0])   # uncalibrated
+    win._set_btn.click()
+    assert state.mode == MODE_CALIBRATE
+    assert "calibrate first" in state.message
